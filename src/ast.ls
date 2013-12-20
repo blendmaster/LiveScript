@@ -1944,6 +1944,12 @@ class exports.Throw extends Jump
 
   compileNode: (o) -> "throw #{ @it?compile o, LEVEL_PAREN or \null };"
 
+#### YadaYadaYada
+# `...` indicates unimplementedness.
+class exports.YadaYadaYada extends Throw
+  ~>
+  compileNode: (o) -> "throw Error('unimplemented');"
+
 #### Return
 class exports.Return extends Jump
   ~> if it and it.value is not \void then import {it}
@@ -2055,7 +2061,8 @@ class exports.While extends Node
         lines[*-1]?=makeReturn res = o.scope.assign \results$ empty
       ret += "\n#{@tab}return #{ res or empty };"
       @else?makeReturn!
-    yet and lines.unshift JS "#yet = false;"
+    if yet
+      code += "#yet = false;\n"
     code += "\n#that\n#tab" if @body.compile o, LEVEL_TOP
     code += mid
     code += \}

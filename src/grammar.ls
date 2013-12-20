@@ -181,7 +181,7 @@ bnf =
     o \COMMENT -> L JS $1, true true
 
     # [yadayadayada](http://search.cpan.org/~tmtm/Yada-Yada-Yada-1.00/Yada.pm)
-    o \... -> L Throw JS "Error('unimplemented')"
+    o \... -> L YadaYadaYada! #Throw JS "Error('unimplemented')"
 
     o 'REQUIRE Chain'   -> Require $2.unwrap!
 
