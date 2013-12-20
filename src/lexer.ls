@@ -316,6 +316,7 @@ exports import
 
   # Matches block comments.
   doComment: (code, index) ->
+    @carp 'Block comments are not supported'
     comment = if ~end = code.indexOf \*/ index+2
               then code.slice index, end+2
               else code.slice(index) + \*/
@@ -326,6 +327,7 @@ exports import
 
   # Matches embedded JavaScript.
   doJS: (code, JSTOKEN.lastIndex) ->
+    @carp 'embedded JS is not supported'
     js = JSTOKEN.exec code .0 or @carp 'unterminated JS literal'
     @token \LITERAL Object(detab js.slice(2 -2), @dent) <<< {+js}, true
     @countLines(js)length
@@ -1119,7 +1121,7 @@ character = if not JSON? then uxxxx else ->
         and tokens[i+3]?0 is \STRNUM
         and tokens[i+4]?0 is \]))
         continue
-      
+
       if tokens[i+2]0 is \BY
         tokens[i+2]0 = \RANGE_BY
       token.op = token.1
