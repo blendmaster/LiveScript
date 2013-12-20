@@ -325,7 +325,6 @@ class Atom extends Node
 # `this`, `debugger`, regexes and primitives.
 class exports.Literal extends Atom
   (@value) ~>
-    return JS "#value" true if value.js
     return new Super        if value is \super
 
   isEmpty    : -> @value in <[ void null ]>
