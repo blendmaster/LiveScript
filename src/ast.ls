@@ -2430,7 +2430,9 @@ class exports.JS extends Node
 
   ::isAssignable = ::isCallable = -> not @comment
 
-  compile: -> if @literal then entab @code, it.indent else @code
+  compile: ->
+    console.error "JS used internally:#{if @comment then '(comment)' else ''} #{@code}"
+    if @literal then entab @code, it.indent else @code
 
 #### Require
 class exports.Require extends Node
@@ -2749,7 +2751,7 @@ UTILS =
       if (className == '[object Array]') {
         alength = a.length;
         blength = b.length;
-        if (first) { 
+        if (first) {
           switch (type) {
           case '===': result = alength === blength; break;
           case '<==': result = alength <= blength; break;
