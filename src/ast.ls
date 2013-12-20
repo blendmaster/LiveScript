@@ -2298,7 +2298,13 @@ class exports.Case extends Node
     code = ''
     for t in tests then code += tab + "case #{ t.compile o, LEVEL_PAREN }:\n"
     {lines} = @body; last = lines[*-1]
-    lines[*-1] = JS '// fallthrough' if ft = last?value is \fallthrough
+
+    ft = last?value is \fallthrough
+
+    # fallthrough is represented as a Var, so remove it to avoid
+    # compiling a dummy variable
+    lines.pop! if ft
+
     o.indent = tab += TAB
     code += that + \\n        if @body.compile o, LEVEL_TOP
     code += tab  + 'break;\n' unless nobr or ft or last instanceof Jump

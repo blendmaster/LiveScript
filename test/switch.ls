@@ -72,7 +72,6 @@ case !2:
 case !3:
   break;
 case !4:
-  // fallthrough
 case !(that = 5):
   that;
   break;
