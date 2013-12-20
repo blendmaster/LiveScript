@@ -139,6 +139,7 @@ function runTests global.LiveScript
     if failedTests
       process.exit 1
   dir(\test)forEach (file) ->
+    say "testing #file"
     return unless /\.ls$/i.test file
     code = slurp filename = path.join \test file
     try LiveScript.run code, {filename} catch
