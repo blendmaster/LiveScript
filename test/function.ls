@@ -66,7 +66,7 @@ eq 6, sum(->
 eq 20, sum ->
   7 + 9
 , ->
-  /* spacer */
+  #/* spacer */
   1 + 3
 
 
@@ -186,8 +186,8 @@ eq --n, 0
 
 eq ok, do ->
   ok
-  /* Should `return` implicitly   */
-  /* even with trailing comments. */
+  #/* Should `return` implicitly   */
+  #/* even with trailing comments. */
 
 
 throws 'misplaced function declaration on line 1', ->
@@ -393,8 +393,8 @@ eq 6 (a <- g 6; a)
 eq '192' do
   <- '081'replace /./g
   -~it
-  /* ignore trailing */
-  /* block comments */
+  #/* ignore trailing */
+  #/* block comments */
 
 
 addArr = do

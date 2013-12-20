@@ -268,9 +268,9 @@ o = Object a:
 eq 6, o.a.b * o.a.c
 
 
-/* Top-level braceless object */
+#/* Top-level braceless object */
 obj: 1
-/* doesn't break things. */
+#/* doesn't break things. */
 
 
 # With number arguments.
@@ -324,8 +324,8 @@ eq 2, (Array 1: 2, 3).length
 
 # With leading comments.
 obj =
-  /* comment one */
-  /* comment two */
+  #/* comment one */
+  #/* comment two */
   one: 1, two: 2
   fun: -> [zero: 0; three: @one + @two][1]
 
@@ -353,22 +353,22 @@ eq o.r.s, 1
 i = 0
 o = splat: 'me'
 obj = {
-  /* leading comment  */
+  #/* leading comment  */
   (4 * 2): 8
-  /* cached shorthand */
+  #/* cached shorthand */
   (++i)
   (--i) or 'default value'
-  /*      splat       */
+  #/*      splat       */
   ...o
   ...: splatMe: 'too'
-  /*   normal keys    */
+  #/*   normal keys    */
   key: ok
   's': ok
   0.5: ok
 
   "#{'interpolated'}":
     """#{"nested"}""": 123: 456
-  /* traling comment  */
+  #/* traling comment  */
 }
 eq obj.interpolated.nested[123], 456
 eq obj[8], 8

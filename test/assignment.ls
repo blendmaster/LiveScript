@@ -95,7 +95,7 @@ compileThrows 'invalid accessign' 1 'f()?= x'
 
 
 # Empty assignments
-{} = -> /* will be front and should be wrapped */
+{} = -> # /* will be front and should be wrapped */
 
 eq 1, [] = 1
 eq 9, 3 * [] = 2 + 1
@@ -421,7 +421,7 @@ eq \HELLO 'hello'.to-upper-case!
 ### Ill-shadow Protection
 compileThrows 'accidental shadow of "a"' 4 '''
   a = 1
-  let 
+  let
     a := 2
     a  = 3
 '''

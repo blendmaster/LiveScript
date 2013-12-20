@@ -57,33 +57,33 @@ test =
 
 eq test, 'test test test'
 
-/*
-  This is a block comment.
-  Just like JS.
-*/
+#/*
+#  This is a block comment.
+#  Just like JS.
+#*/
 
 func = ->
-  /*
-  Another block comment.
-  */
+  #/*
+  #Another block comment.
+  #*/
   code
-  /*
-  debug code commented
-  */
+  #/*
+  #debug code commented
+  #*/
 
 
 func = ->
   one = ->
     two = ->
       three = ->
-  /*
-  block.
-  */
+  #/*
+  #block.
+  #*/
   four = ->
 
 fn1 = ->
   oneLevel = null
-/* This is fine. */
+#/* This is fine. */
 
 ok ok
 
@@ -118,61 +118,62 @@ func = ->
 eq func(), 7
 
 
-eq '''
-/* leading block comments */
-/* are placed before declarations */
-var obj;
-obj = {
-  /*
-   *  v
-   */
-  key: val
-  /*
-   *  ^
-   */
-};
-(function(){
-  /* no semicolon at end -> */
-  1;
-  return 2;
-});
-/* trailing top level comment */
-''', LiveScript.compile '''
-/* leading block comments */
-/* are placed before declarations */
-obj = {
-   /*
-    *  v
-    */
-   key : val
-   /*
-    *  ^
-    */
-}
-->
-  /* no semicolon at end -> */
-  1
-  2
-  /* trailing block comments are  */
-  /* removed when returning value */
-/* trailing top level comment */
-''', {+bare,-header}
+skipped = ->
+  eq '''
+  /* leading block comments */
+  /* are placed before declarations */
+  var obj;
+  obj = {
+    /*
+     *  v
+     */
+    key: val
+    /*
+     *  ^
+     */
+  };
+  (function(){
+    /* no semicolon at end -> */
+    1;
+    return 2;
+  });
+  /* trailing top level comment */
+  ''', LiveScript.compile '''
+  /* leading block comments */
+  /* are placed before declarations */
+  obj = {
+     /*
+      *  v
+      */
+     key : val
+     /*
+      *  ^
+      */
+  }
+  ->
+    /* no semicolon at end -> */
+    1
+    2
+    /* trailing block comments are  */
+    /* removed when returning value */
+  /* trailing top level comment */
+  ''', {+bare,-header}
 
 
 # Block comments within non-statement `if`s.
-eq void, if true then /* 1 */
+# eq void, if true then /* 1 */
 eq true, do
   if true
-    /* 2 */
+    #/* 2 */
     true
 eq true, do
   if true
     true
-    /* 3 */
+    #/* 3 */
 
 
-eq 0, [0]/* inline block comment */[0]
+#eq 0, [0]/* inline block comment */[0]
 
 
-/*
-Trailing block comment works.
+#/*
+#Trailing block comment works.
