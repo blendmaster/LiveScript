@@ -156,7 +156,13 @@
 
   # Constructs a node that returns the current node's result.
   makeReturn: (arref) ->
-    if arref then Call.make JS(arref + \.push), [this] else Return this
+    if arref
+      # add value into current array return buffer
+      Chain Var arref
+        ..add Index Key \push
+        ..add Call [this]
+    else
+      Return this
 
   makeObjReturn: (arref) ->
     if arref
@@ -393,6 +399,8 @@ class exports.Key extends Node
 #### Index
 # Dots and brackets to access an object's property.
 class exports.Index extends Node
+  # XXX if symbol is [] or {}, it means to vivify, otherwise it
+  # MUST be \.
   (key, symbol or \., init) ~>
     if init and key instanceof Arr
       switch key.items.length
@@ -616,7 +624,10 @@ class exports.Chain extends Node
       node.carp 'invalid accessign' if node.assign and not bust.isAssignable!
       test = if node instanceof Call
         [test, @head] = bust.cacheReference o
-        JS "typeof #{ test.compile o, LEVEL_OP } === 'function'"
+        # typeof it === 'function'
+        Binary \===,
+          Unary \typeof test
+          Literal "'function'"
       else
         if i and node.assign
           [test, bust] = bust.cacheReference o
@@ -644,10 +655,14 @@ class exports.Chain extends Node
       return Assign(left, this, op) <<< {+access}
 
   expandSplat: !(o) ->
-    {tails} = this; i = -1; while call = tails[++i]
+    {tails} = this; i = -1;
+    while call = tails[++i]
       continue unless args = call.args
+
       ctx = call.method is \.call and (args.=concat!)shift!
+
       continue unless args = Splat.compileArray o, args, true
+
       if call.new
         @splatted-new-args = args
       else
@@ -675,7 +690,8 @@ class exports.Chain extends Node
       [sub, ref, temps] = Chain(@head, tails.splice 0 i)unwrap!cache o
       value = Chain(ref, [Index Key \length])compile o
       for star in stars then star <<< {value, isAssignable: YES}
-      @head = JS sub.compile(o, LEVEL_CALL) + tails.shift!compile o
+      @head =
+        JS sub.compile(o, LEVEL_CALL) + tails.shift!compile o
       o.scope.free temps.0 if temps
       i = -1
     !function seek
@@ -718,6 +734,8 @@ class exports.Call extends Node
     code  =  (@method or '') + \( + (if @pipe then "\n#{o.indent}" else '')
     for a, i in @args then code += (if i then ', ' else '') + a.compile o, LEVEL_LIST
     code + \)
+
+  # helper method to make Call chain from other nodes
   @make = (callee, args, opts) ->
     call = Call args
     call <<< opts if opts
@@ -852,7 +870,8 @@ class exports.Obj extends List
       ID.test key or key = do Function "return #key"
       node.carp "duplicate property \"#key\"" unless dic"#key." .^.= 1
     code = "{#{ code and code + \\n + @tab }}"
-    rest and code = Import(JS code; Obj rest)compile o <<< indent: @tab
+    if rest
+      code = Import(JS code; Obj rest)compile o <<< indent: @tab
     if @front and \{ is code.charAt! then "(#code)" else code
 
 #### Prop
@@ -922,6 +941,8 @@ class exports.Arr extends List
     return nodes.0 if nodes.length is 1 and nodes.0 not instanceof Splat
     constructor nodes
 
+  # make array with input JS node assuming as splat
+  # TODO remove all cases of this
   @wrap = -> constructor [Splat it <<< isArray: YES]
 
 #### Unary operators
@@ -1185,15 +1206,22 @@ class exports.Binary extends Node
       Chain(@first, [Index Key method; Call args])compile o
     else
       args.unshift @first
-      Call.make(JS util(method) + \.call; args)compile o
+
+      # call utility method with this = @first
+      (Chain Var util method
+        ..add Index Key \call
+        ..add Call args
+      )compile o
 
   compileJoin   : -> @compileMethod it, \Array  \join
-  compileRemove : -> @compileMethod it, \String \replace JS "''"
+  compileRemove : -> @compileMethod it, \String \replace Literal "''"
   compileSplit  : -> @compileMethod it, \String \split
 
   compileRepeat: (o) ->
+
     {first: x, second: n} = this
     {items} = x.=expandSlice o .unwrap!
+
     arr = x.isArray! and \Array
     if items and Splat.compileArray o, items
       x     = JS that
@@ -1216,11 +1244,16 @@ class exports.Binary extends Node
       (q = (x.=compile o)charAt!) + "#{ x.slice 1 -1 }" * n + q
     # `"#{x}" * 2` => `(ref$ = "" + x) + ref$`
     else
-      if n < 1 then return Block(x.it)add(JS "''")compile o
+      if n < 1 then return Block(x.it)add(Literal "''")compile o
       x = (refs = x.cache o, 1, LEVEL_OP)0 + " + #{refs.1}" * (n-1)
       if o.level < LEVEL_OP + PREC\+ then x else "(#x)"
 
-  compilePow: (o) -> Call.make(JS \Math.pow; [@first, @second])compile o
+  compilePow: (o) ->
+    # math.pow(first, second)
+    (Chain Var \Math
+      ..add Index Key \pow
+      ..add Call [@first, @second]
+    )compile o
 
   compileConcat: (o) ->
     f = (x) ->
@@ -1349,6 +1382,7 @@ class exports.Assign extends Node
     op = (op.slice 1 -2) + \= if op in <[ .&.= .|.= .^.= .<<.= .>>.= .>>>.= ]>
     (right.=unparen!)ripName left.=unwrap!
     sign = op.replace \: ''
+
     name = (left <<< {+front})compile o, LEVEL_LIST
     if lvar = left instanceof Var
       if op is \=
@@ -1400,17 +1434,31 @@ class exports.Assign extends Node
   # See <http://wiki.ecmascript.org/doku.php?id=harmony:destructuring>.
   compileDestructuring: (o, {{length: len}:items}:left) ->
     ret  = o.level and not @void
-    rite = @right.compile o, if len is 1 then LEVEL_CALL else LEVEL_LIST
+
+    rite = @right
+    r-compile-level = if len is 1 then LEVEL_CALL else LEVEL_LIST
+
     if left.name
-      cache = "#that = #rite"
-      o.scope.declare rite = that, left
-    else if (ret or len > 1) and (not ID.test rite or left.assigns rite)
-      cache = "#{ rref = o.scope.temporary! } = #rite"
-      rite  = rref
+      # reuse the existing Var
+      cache = "#that = #{rite.compile o, r-compile-level}"
+      o.scope.declare left.name, left
+      rite = Var left.name
+    else if (ret or len > 1)
+      is-literal = rite instanceof Literal
+      is-var = rite instanceof Var
+      assigned-by-left = is-var and left.assigns rite.value
+      if not is-literal and not is-var or assigned-by-left
+        # can't use right, so assign temporary to it
+        rref = o.scope.temporary!
+        cache = "#rref = #{rite.compile o, r-compile-level}"
+        rite  = Var rref
+
     list = @"rend#{ left.constructor.displayName }" o, items, rite
+
     o.scope.free rref  if rref
     list.unshift cache if cache
-    list.push rite     if ret or not list.length
+    if ret or not list.length
+      list.push rite.compile o, r-compile-level
     code = list.join ', '
     if list.length < 2 or o.level < LEVEL_LIST then code else "(#code)"
 
@@ -1428,40 +1476,109 @@ class exports.Assign extends Node
       continue if node.isEmpty!
       if node instanceof Splat
         len and node.carp 'multiple splat in an assignment'
+
         skip = (node.=it)isEmpty!
-        if i+1 is len = nodes.length
+
+        len = nodes.length
+
+        if i+1 is len
           break if skip
-          val = Arr.wrap JS \
-            util(\slice) + \.call( + rite + if i then ", #i)" else \)
+
+          args = [rite]
+          args.push Literal i if i > 0
+
+          # slice$.call(rite, i)
+          slice = Chain Var util \slice
+            ..add Index Key \call
+            ..add Call args
+
+          val = Arr.wrap slice
         else
-          val = ivar = "#rite.length - #{ len - i - 1 }"
+          # rite.length - (len - i - 1)"
+          val = ivar =
+            Binary \-,
+              Chain rite .add Index Key \length
+              Literal "#{len - i - 1}"
+
           # Optimize `[..., a] = b`.
-          continue if skip and i+2 is len
-          start = i+1; @temps = [ivar = o.scope.temporary \i]
-          val = if skip then node = Var ivar; Var val else
-            Arr.wrap JS "#i < (#ivar = #val)
-                       \ ? #{ util \slice }.call(#rite, #i, #ivar)
-                       \ : (#ivar = #i, [])"
+          if skip and i+2 is len
+            # note that ivar and val are still set
+            # so this changes behavior of the non-splat case
+            continue
+
+          start = i+1;
+
+          ivar = Var o.scope.temporary \i
+
+          @temps = [ivar.value]
+
+          val = if skip
+            node = ivar
+            val
+          else
+            # splat section of array
+            # i < (ivar = val)
+            # ? slice$.call(rite, i, ivar)
+            # : (ivar = i, [])"
+            f = If Binary(\<, Literal(i), Assign(ivar, val))
+            # XXX to match old compilation, force compact
+            # ternary expression
+            f.compact = true
+            f.then =
+                Chain Var util \slice
+                  .add Index Key \call
+                  .add Call [rite, Literal(i), ivar]
+            f.else =
+              Block [
+                Assign ivar, Literal i
+                Arr []
+              ]
+            Arr.wrap f
       else
-        (inc = ivar) and start < i and inc += " + #{ i - start }"
-        val = Chain rcache||=Literal(rite), [Index JS inc || i]
+        idx =
+          if ivar?
+            # if there was a splat that set ivar to cache
+            # its location
+            if start < i
+              # [ivar + (i - start)]
+              Binary \+,
+                ivar
+                Literal "#{i - start}"
+            else
+              ivar
+          else
+            Literal i
+
+        val = Chain rite, [Index idx]
+
       if node instanceof Assign
         node = Binary node.op, node.left, node.right, (node.logic or true)
+
       (this with {left: node, right: val, +void})compile o, LEVEL_PAREN
 
   rendObj: (o, nodes, rite) ->
     for node in nodes
       node.=it if splat = node instanceof Splat
+
       # `{a or b} = c` => `a = c.a or b`
-      node.=first if logic = node.getDefault!
+      logic = node.getDefault!
+      if logic
+        node.=first
+
       if node instanceof Parens
         [node, key] = Chain(node.it)cacheReference o
       else if node instanceof Prop
-      then node = ({key} = node)val
-      else key  = node
+        node = ({key} = node)val
+      else
+        key  = node
+
       node = Var node.name if node instanceof Key
       node = logic <<< first: node if logic
-      val  = Chain rcache||=Var(rite), [Index key.maybeKey!]
+      # XXX rite needs parenthesis for cases that the legacy
+      # mode of wrapping raw JS in a 'Var' node seemed to paper over
+      unless rite instanceof Var
+        rite = Parens rite, true # force parens
+      val  = Chain rite, [Index key.maybeKey!]
       val  = Import Obj!, val if splat
       (this with {left: node, right: val, +void})compile o, LEVEL_PAREN
 
@@ -1484,7 +1601,12 @@ class exports.Import extends Node
       if left.=it instanceof Var
         {value} = @left = left
         unless o.scope.check value, true
-          left = JS "typeof #value != 'undefined' && #value"
+          # typeof value != 'undefined' && value
+          left = Binary \&&,
+            Binary \!=,
+              Unary \typeof left
+              Literal "'undefined'"
+            left
       else
         [left, @left, temps] = left.cache o
       return If(left, this) <<< {temps, +soak, @cond, @void}
@@ -1528,7 +1650,7 @@ class exports.Import extends Node
       else if node instanceof Prop
         {key, val} = node
         if node.accessor
-          key = JS "'#{key.name}'" if key instanceof Key
+          key = Literal "'#{key.name}'" if key instanceof Key
           code += "Object.defineProperty(#{ reft.compile o, LEVEL_LIST }
                                        , #{ key .compile o, LEVEL_LIST }
                                        , #{ node.compileDescriptor o })"
@@ -2061,7 +2183,7 @@ class exports.While extends Node
       ret += "\n#{@tab}return #{ res or empty };"
       @else?makeReturn!
     if yet
-      code += "#yet = false;\n"
+      code += "\n#yet = false;\n"
     code += "\n#that\n#tab" if @body.compile o, LEVEL_TOP
     code += mid
     code += \}
@@ -2170,10 +2292,15 @@ class exports.For extends While
     o.indent += TAB
     if @index and not @object
       head += \\n + o.indent +
-        Assign(Var @index; JS idx).compile(o, LEVEL_TOP) + \;
+        Assign(Var @index; Var idx).compile(o, LEVEL_TOP) + \;
     if @item and not @item.isEmpty!
-      head += \\n + o.indent +
-        Assign(@item, JS "#svar[#idx]")compile(o, LEVEL_TOP) + \;
+      head += \\n + o.indent
+      head +=
+        Assign(
+          @item,
+          Chain Var(svar) .add Index(Var(idx)) # svar[idx]
+        )compile(o, LEVEL_TOP)
+      head += \;
     o.ref = @item.value if @ref
     body  = @compileBody o
     head += \\n + @tab if (@item or (@index and not @object)) and \} is body.charAt 0
@@ -2203,8 +2330,10 @@ class exports.Try extends Node
   compileNode: (o) ->
     o.indent += TAB
     code = 'try ' + @compileBlock o, @attempt
-    if @recovery or not @ensure and JS ''
-      code += ' catch (e$) ' + @compileBlock o, that
+    if @recovery? or not @ensure
+      if not @recovery?
+        @recovery = Block [] # empty
+      code += ' catch (e$) ' + @compileBlock o, @recovery
     if @ensure
       code += ' finally '    + @compileBlock o, that
     code
@@ -2313,6 +2442,9 @@ class exports.Case extends Node
 # The `if`/`else` structure that acts as both statement and expression.
 class exports.If extends Node
   (@if, @then, @un) ~>
+    # whether to compile ternary expressions in one line
+    # default false, but caller-settable
+    @compact = false
 
   children: <[ if then else ]>
 
@@ -2351,7 +2483,11 @@ class exports.If extends Node
     if not @else and (@cond or @void)
       return Parens Binary \&& @if, thn .compile o
     code = @if.compile o, LEVEL_COND
-    pad  = if els.isComplex! then \\n + o.indent += TAB else ' '
+    pad  =
+      if not @compact and els.isComplex!
+        \\n + o.indent += TAB
+      else
+        ' '
     code += "#pad? #{ thn.compile o, LEVEL_LIST }
              #pad: #{ els.compile o, LEVEL_LIST }"
     if o.level < LEVEL_COND then code else "(#code)"
