@@ -657,7 +657,7 @@ class exports.Chain extends Node
   expandSplat: !(o) ->
     {tails} = this; i = -1;
     while call = tails[++i]
-      continue unless args = call.args
+      continue unless args = call.args # i.e. call is actually a Call
 
       ctx = call.method is \.call and (args.=concat!)shift!
 
@@ -669,7 +669,10 @@ class exports.Chain extends Node
         if not ctx and tails[i-1] instanceof Index
           [@head, ctx] = Chain(@head, tails.splice 0 i-1)cache o, true
           i = 0
-        call <<< method: \.apply, args: [ctx or Literal \null; JS args]
+        call <<< {
+          method: \.apply
+          args: [ctx or Literal \null; JS args]
+        }
 
   expandBind: !(o) ->
     {tails} = this; i = -1; while tails[++i]
@@ -1233,7 +1236,7 @@ class exports.Binary extends Node
     return x.compile o if 1 <= n < 2
     # `[x] * 2` => `[x, x]`
     if items
-      if n < 1 then return Block items .add JS '[]' .compile o
+      if n < 1 then return Block items .add Arr([]) .compile o
       refs = []
       for item, i in items then [items[i], refs.*] = item.cache o, 1x
       items.push JS! <<<
@@ -1929,7 +1932,11 @@ class exports.Class extends Node
         , fun.params.* = Var \superclass
     if @mixins
       imports = for args.* in that
-        Import proto, JS("arguments[#{args.length-1}]"), true
+        Import do
+          proto
+          # arguments[(args.length - 1)]
+          Chain(Var(\arguments))add Index Literal (args.length - 1)
+          true
       body.prepend ...imports
     body.prepend Literal "#name.displayName = '#name'" if fun.cname and not @sup
     clas = Parens Call.make(fun, args), true
@@ -2031,7 +2038,9 @@ class exports.Splat extends Node
 
   function ensureArray node
     return node if node.isArray!
-    Call.make JS(util(\slice) + \.call), [node]
+    Chain Var util \slice
+      ..add Index Key \call
+      ..add Call [node]
 
 #### Jump
 # `break` `continue`
