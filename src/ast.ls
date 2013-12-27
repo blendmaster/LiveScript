@@ -595,7 +595,9 @@ class exports.Chain extends Node
         .add Index Key \apply
         .add Call [context, Arr [this; Arr partial.args; Arr partial.partialized]]), post).compile o
     @carp 'invalid callee' if tails.0 instanceof Call and not head.isCallable!
+
     @expandSlice o; @expandBind o; @expandSplat o; @expandStar o
+
     if @splatted-new-args
       idt = o.indent + TAB
       func = Chain @head, tails.slice 0 -1
@@ -655,23 +657,57 @@ class exports.Chain extends Node
       return Assign(left, this, op) <<< {+access}
 
   expandSplat: !(o) ->
-    {tails} = this; i = -1;
+    {tails} = this
+    i = -1
     while call = tails[++i]
-      continue unless args = call.args # i.e. call is actually a Call
+      continue unless call.args
+      # i.e. call _is_ actually a Call, not and Index or something
 
-      ctx = call.method is \.call and (args.=concat!)shift!
+      args = call.args.slice!
 
-      continue unless args = Splat.compileArray o, args, true
+      # shift `this` context if already present, else ctx = void
+      ctx = if call.method is \.call then args.shift!
+
+      seen = false
+      for node in args
+        seen = true if node instanceof Splat
+      # if there are no splats, don't bother doing anything
+      continue unless seen
+
+      args = Splat.expandArray args, true # apply = true
 
       if call.new
-        @splatted-new-args = args
+        # we can't do the prototype-setting `new` with .apply() semantics, so
+        # save the args to be compiled using a special hack in `compileNode`
+        @splatted-new-args = List.compile o, args
       else
+        # if there is no 'this' context and the last part of the chain
+        # was an index [] access, cache everything before this part of the
+        # chain as a temporary variable, and make that the context
+        #
+        # e.g.
+        #
+        # a[b].c(...d)
+        #
+        # # =>
+        #
+        # (temp = a[b]).c.apply(temp, d)
+        #
+        # This ensures that a possibly complicated index expression (b) isn't
+        # evaluated more than once.
         if not ctx and tails[i-1] instanceof Index
-          [@head, ctx] = Chain(@head, tails.splice 0 i-1)cache o, true
+          cached-tails = tails.splice 0 i-1
+
+          # assign the new @head of this chain and the ctx of this call
+          [@head, ctx] = Chain(@head, cached-tails)cache o, true
+
+          # reset counting to the now-mutated tails array
           i = 0
+
+        # mutate the call to apply the Arr of the expanded splat arg
         call <<< {
           method: \.apply
-          args: [ctx or Literal \null; JS args]
+          args: [ctx or Literal(\null), ...args]
         }
 
   expandBind: !(o) ->
@@ -936,9 +972,11 @@ class exports.Arr extends List
   compile: (o) ->
     {items} = this
     return '[]' unless items.length
-    if code = Splat.compileArray o, items
+    # if there are splats to expand out
+    if code = Splat.compileArray o, items, false
       return if @newed then "(#code)" else code
-    "[#{ List.compile o, items, @deepEq }]"
+    else
+      "[#{ List.compile o, items, @deepEq }]"
 
   @maybe = (nodes) ->
     return nodes.0 if nodes.length is 1 and nodes.0 not instanceof Splat
@@ -1226,7 +1264,7 @@ class exports.Binary extends Node
     {items} = x.=expandSlice o .unwrap!
 
     arr = x.isArray! and \Array
-    if items and Splat.compileArray o, items
+    if items and Splat.compileArray o, items, false
       x     = JS that
       items = null
     if arr and not items
@@ -1578,7 +1616,7 @@ class exports.Assign extends Node
       node = Var node.name if node instanceof Key
       node = logic <<< first: node if logic
       # XXX rite needs parenthesis for cases that the legacy
-      # mode of wrapping raw JS in a 'Var' node seemed to paper over
+      # mode of wrapping raw js in a 'Var' node seemed to paper over
       unless rite instanceof Var
         rite = Parens rite, true # force parens
       val  = Chain rite, [Index key.maybeKey!]
@@ -2002,7 +2040,68 @@ class exports.Splat extends Node
 
   assigns: -> @it.assigns it
 
+  # if the splat hasn't already been expanded by another
+  # node's compilation, than it's not in the right place
   compile: -> @carp 'invalid splat'
+
+  # expands a list of nodes mixed with splats to an array. Note that the
+  # return is _not_ an Arr (ast node). A caller can thus use the return value
+  # as arguments _or_ an array literal.
+  @expandArray = (list, apply) ->
+    expand list
+    index = 0
+    for node in list
+      break if node instanceof Splat
+      ++index
+
+    # if there are no splats, return the original array (list)
+    return list if index >= list.length
+
+    unless list.length >= 2
+      # the first and only element of the array is the splat
+      # so simply unwrap it
+      #
+      # Function::apply can take array-like objects, but other
+      # uses require 'slice' to turn array-likes to actual arrays
+      if apply
+        return [list.0.it]
+      else # we need an array from array-likes (arguments)
+        return [ensureArray list.0.it]
+
+    # we have multiple items, at least one of which is a splat
+    # We turn compile the array as groups of non-splats (atoms)
+    # and the internal splats, then concat them with either the
+    # non-splats before the first splat or the first arg (also all
+    # non-splats)
+    #
+    # e.g.
+    #
+    # [1, 2, ...a, 3, 4, ...b, 5] => [1 2].concat(a.slice(), [3, 4], b.slice(), [5])
+    args = []; atoms = []
+
+    # for all nodes after the first splat
+    for node in list.splice index, 9e9
+      if node instanceof Splat
+        args.push Arr atoms.splice 0, 9e9 if atoms.length
+        args.push ensureArray node.it
+      else atoms.push node
+
+    args.push Arr atoms if atoms.length # push last batch of atoms
+
+    head =
+      if index > 0 # there are still things remaining in 'list'
+        # use the mutated list variable
+        # e.g. [1, ...a] = [1].concat(a)
+        Arr list
+      else
+        # use the first item in the args
+        # e.g. [...a, ...b] = a.concat(b)
+        args.shift!
+
+    c = Chain head
+      ..add Index Key \concat
+      ..add Call args
+    return [c]
 
   # Compiles a list of nodes mixed with splats to a proper array.
   @compileArray = (o, list, apply) ->
@@ -2011,20 +2110,39 @@ class exports.Splat extends Node
     for node in list
       break if node instanceof Splat
       ++index
+
+    # if there are no splats, return falsey which callers key off of
     return '' if index >= list.length
-    unless list.1
+
+    unless list.1 # there are at least two items
+      # just compile the singleton, with some sort of logic on apply
       return (if apply then Object else ensureArray) list.0.it
              .compile o, LEVEL_LIST
+
+    # we have multiple items, at least one of which is a splat
+    # We turn compile the array as groups of non-splats (atoms)
+    # and the internal splats, then concat them with either the
+    # non-splats before the first splat or the first arg (also all
+    # non-splats)
+    #
+    # e.g.
+    #
+    # [1, 2, ...a, 3, 4, ...b, 5] => [1 2].concat(a.slice(), [3, 4], b.slice(), [5])
     args = []; atoms = []
+
+    # for all nodes after the first splat
     for node in list.splice index, 9e9
       if node instanceof Splat
         args.push Arr atoms.splice 0, 9e9 if atoms.length
         args.push ensureArray node.it
       else atoms.push node
     args.push Arr atoms if atoms.length
-    (if index then Arr list else args.shift!)compile(o, LEVEL_CALL) +
+    (if index > 0 then Arr list else args.shift!)compile(o, LEVEL_CALL) +
     ".concat(#{ List.compile o, args })"
 
+  # flattens the nodes array's splats of array literals
+  # e.g. [...[1, 2], 3] -> [1, 2, 3]
+  # deep flatten, so splats within splats are flattened
   function expand nodes
     index = -1
     while node = nodes[++index] then if node instanceof Splat
@@ -2348,7 +2466,7 @@ class exports.Try extends Node
     code
 
 #### Switch
-# Compiles to the regular JS `switch`-`case`-`default`,
+# Compiles to the regular js `switch`-`case`-`default`,
 # but with forced `break` after each cases.
 class exports.Switch extends Node
   (@type, @topic, @cases, @default) ->
