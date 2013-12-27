@@ -1039,7 +1039,9 @@ class exports.Arr extends List
     {items} = this
     return '[]' unless items.length
     # if there are splats to expand out
-    if code = Splat.compileArray o, items, false
+    if Splat.hasSplats items
+      code = Splat.expandArray(items, false)compile o
+
       return if @newed then "(#code)" else code
     else
       "[#{ List.compile o, items, @deepEq }]"
@@ -2195,43 +2197,6 @@ class exports.Splat extends Node
     Chain head
       ..add Index Key \concat
       ..add Call args
-
-  # Compiles a list of nodes mixed with splats to a proper array.
-  @compileArray = (o, list, apply) ->
-    expand list
-    index = 0
-    for node in list
-      break if node instanceof Splat
-      ++index
-
-    # if there are no splats, return falsey which callers key off of
-    return '' if index >= list.length
-
-    unless list.1 # there are at least two items
-      # just compile the singleton, with some sort of logic on apply
-      return (if apply then Object else ensureArray) list.0.it
-             .compile o, LEVEL_LIST
-
-    # we have multiple items, at least one of which is a splat
-    # We turn compile the array as groups of non-splats (atoms)
-    # and the internal splats, then concat them with either the
-    # non-splats before the first splat or the first arg (also all
-    # non-splats)
-    #
-    # e.g.
-    #
-    # [1, 2, ...a, 3, 4, ...b, 5] => [1 2].concat(a.slice(), [3, 4], b.slice(), [5])
-    args = []; atoms = []
-
-    # for all nodes after the first splat
-    for node in list.splice index, 9e9
-      if node instanceof Splat
-        args.push Arr atoms.splice 0, 9e9 if atoms.length
-        args.push ensureArray node.it
-      else atoms.push node
-    args.push Arr atoms if atoms.length
-    (if index > 0 then Arr list else args.shift!)compile(o, LEVEL_CALL) +
-    ".concat(#{ List.compile o, args })"
 
   # flattens the nodes array's splats of array literals
   # e.g. [...[1, 2], 3] -> [1, 2, 3]
