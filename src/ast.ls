@@ -720,19 +720,43 @@ class exports.Chain extends Node
       @head = if @newed then Parens call, true else call
       i = -1
 
+  # change all stars in Indexes to containing length references
   expandStar: !(o) ->
-    {tails} = this; i = -1; while tails[++i]
+    {tails} = this
+    i = -1
+    while tails[++i]
       continue if that.args or that.stars or that.key instanceof Key
-      stars = that.stars = []
-      that.eachChild seek
-      continue unless stars.length
+
+      stars = []
+
+      that.eachChild seek # fill stars array
+
+      continue unless stars.length > 0
+
       [sub, ref, temps] = Chain(@head, tails.splice 0 i)unwrap!cache o
+
+      # change all star literals to to "ref.length"
+      # XXX this abuses the defaut compilation strategy of
+      # Literal to just pass through the value by turning the
+      # `value` to a "ref.length" string.
+      #
+      # Proper compilation would be to replace all the Literal \* nodes
+      # with Chain(ref, [Index Key \length]) nodes, but there aren't
+      # currently nice ast traversal facilities that allow replacement
+      # of nodes, so we'll keep the abuse for now.
       value = Chain(ref, [Index Key \length])compile o
       for star in stars then star <<< {value, isAssignable: YES}
-      @head =
-        JS sub.compile(o, LEVEL_CALL) + tails.shift!compile o
+
+      # replace our head with the assignment and the this Index,
+      # which is now at the first position due to the splice
+      @head = Chain sub, [tails.shift!]
+
       o.scope.free temps.0 if temps
+
+      # all the previous tails were spliced into the temp cache
+      # so start back at the first tail
       i = -1
+
     !function seek
       if it.value is \*               then stars.push it
       else unless it instanceof Index then it.eachChild seek
