@@ -114,14 +114,16 @@ exports import
     if NONASCII.test id
       try Function "var #id" catch then @carp "invalid identifier \"#id\""
     {last} = this
+
     # `id:_` `_.id` `@id`
     if regex-match.2 or last.0 is \DOT or @adi!
       @token \ID if id in JS_KEYWORDS then Object(id) <<< {+reserved} else id
       @token \: \: if regex-match.2
       return input.length
+
     # keywords
     switch id
-    case <[ true false on off yes no null void arguments debugger ]>
+    case <[ true false on off yes no null void debugger ]>
       tag = \LITERAL
     case \new \do \typeof \delete                      then tag = \UNARY
     case \return \throw                                then tag = \HURL

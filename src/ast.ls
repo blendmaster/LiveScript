@@ -350,26 +350,45 @@ class exports.Literal extends Atom
 
   compile: (o, level ? o.level) ->
     switch val = "#{@value}"
-    | \this      => return o.scope.fun?bound or val
+    | \this      => o.scope.fun?bound or val
     | \void      =>
-      return '' unless level
-      val += ' 8'
-      fallthrough
-    | \null      => @carp 'invalid use of ' + @value if level is LEVEL_CALL
-    | \on \yes   => val = 'true'
-    | \off \no   => val = 'false'
+      if level is LEVEL_TOP
+        ''
+      else if level is LEVEL_CALL
+        @carp 'invalid use of ' + @value
+      else
+        'void 8'
+    | \null      =>
+      if level is LEVEL_CALL
+        @carp 'invalid use of ' + @value
+      else
+        'null'
+    | \on \yes   => 'true'
+    | \off \no   => 'false'
     | \*         => @carp 'stray star'
     | \..        =>
-      @carp 'stray reference' unless val = o.ref
-      @cascadee or val.erred = true
-    | \debugger  => if level
-      return "(function(){\n#TAB#{o.indent}debugger;\n#{o.indent}}())"
-    val
+      @carp 'stray reference' unless o.ref
+      if not @cascadee then o.ref.erred = true
+      o.ref
+    | \debugger  =>
+      if level
+        "(function(){\n#TAB#{o.indent}debugger;\n#{o.indent}}())"
+      else
+        \debugger
+    | otherwise =>
+      unless @abused
+        try
+          eval val
+        catch
+          console.error "couldn't eval #val"
+      val
 
 #### Var
 # Variables.
 class exports.Var extends Atom
   (@value) ~>
+    if /\s/.test @value
+      console.error "probably not a var: #{@value}"
 
   ::isAssignable = ::isCallable = YES
 
@@ -745,7 +764,7 @@ class exports.Chain extends Node
       # currently nice ast traversal facilities that allow replacement
       # of nodes, so we'll keep the abuse for now.
       value = Chain(ref, [Index Key \length])compile o
-      for star in stars then star <<< {value, isAssignable: YES}
+      for star in stars then star <<< {value, isAssignable: YES, +abused}
 
       # replace our head with the assignment and the this Index,
       # which is now at the first position due to the splice
@@ -1855,7 +1874,7 @@ class exports.Fun extends Node
     if @bound is \this$
       if @ctor
         scope.assign \this$ 'this instanceof ctor$ ? this : new ctor$'
-        body.lines.push Return Literal \this$
+        body.lines.push Return Var \this$
       else if sscope.fun?bound
       then @bound = that
       else sscope.assign \this$ \this
@@ -2032,7 +2051,7 @@ class exports.Class extends Node
       imports = Chain Import (Literal \this), Var \superclass
       fun.proto = Util.Extends (if fun.cname
         then Block [Assign (imports.add Index Key \displayName), Literal "'#name'"
-                   ; Literal name]
+                   ; Var name]
         else imports)
         , fun.params.* = Var \superclass
     if @mixins
@@ -2043,7 +2062,11 @@ class exports.Class extends Node
           Chain(Var(\arguments))add Index Literal (args.length - 1)
           true
       body.prepend ...imports
-    body.prepend Literal "#name.displayName = '#name'" if fun.cname and not @sup
+    if fun.cname and not @sup
+      # set displayName = 'name'
+      body.prepend Assign do
+        Chain(Var name)add Index Key \displayName
+        Literal "'#name'"
     clas = Parens Call.make(fun, args), true
     clas = Assign vname, clas if decl and title.isComplex!
     clas = Assign title, clas if title
@@ -2410,8 +2433,8 @@ class exports.For extends While
       @item = Literal \.. if delete @ref
       body = Block Call.let do
         with []
-          ..push Assign Var(that), Literal \index$$ if @index
-          ..push Assign that,      Literal \item$$ if @item
+          ..push Assign Var(that), Var \index$$ if @index
+          ..push Assign that,      Var \item$$ if @item
         body
 
     super body
