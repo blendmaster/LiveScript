@@ -606,7 +606,7 @@ class exports.Chain extends Node
         #{idt}ctor.prototype = func.prototype;
         #{idt}var child = new ctor, result = func.apply(child, args), t;
         #{idt}return (t = typeof result)  == "object" || t == "function" ? result || child : child;
-        #{TAB}})(#{ func.compile o}, #{@splatted-new-args}, function(){})
+        #{TAB}})(#{ func.compile o}, #{@splatted-new-args.compile o, LEVEL_CALL}, function(){})
       """
     return @head.compile o unless @tails.length
     base = @head.compile o, LEVEL_CALL; news = rest = ''
@@ -674,12 +674,12 @@ class exports.Chain extends Node
       # if there are no splats, don't bother doing anything
       continue unless seen
 
-      args = Splat.expandArray args, true # apply = true
+      args-expr = Splat.expandArray args, true # apply = true
 
       if call.new
         # we can't do the prototype-setting `new` with .apply() semantics, so
         # save the args to be compiled using a special hack in `compileNode`
-        @splatted-new-args = List.compile o, args
+        @splatted-new-args = args-expr
       else
         # if there is no 'this' context and the last part of the chain
         # was an index [] access, cache everything before this part of the
@@ -707,7 +707,7 @@ class exports.Chain extends Node
         # mutate the call to apply the Arr of the expanded splat arg
         call <<< {
           method: \.apply
-          args: [ctx or Literal(\null), ...args]
+          args: [ctx or Literal(\null), args-expr]
         }
 
   expandBind: !(o) ->
@@ -1264,25 +1264,37 @@ class exports.Binary extends Node
     {items} = x.=expandSlice o .unwrap!
 
     arr = x.isArray! and \Array
-    if items and Splat.compileArray o, items, false
-      x     = JS that
+    if items and Splat.hasSplats items
+      x = Splat.expandArray items, false
       items = null
+
     if arr and not items
     or not (n instanceof Literal and n.value < 0x20)
       return Call.make Util(\repeat + (arr or \String)), [x, n] .compile o
+
     n = +n.value
+
     return x.compile o if 1 <= n < 2
+
     # `[x] * 2` => `[x, x]`
     if items
       if n < 1 then return Block items .add Arr([]) .compile o
+
       refs = []
-      for item, i in items then [items[i], refs.*] = item.cache o, 1x
-      items.push JS! <<<
-        compile: -> (", #{ List.compile o, refs }" * (n-1))slice 2
+
+      for item, i in items
+        [items[i], refs.*] = item.cache o, 1x
+
+      # mutate x's items array to add repetition after initial assigns
+      for i til n-1
+        items.push ...refs
+
       x.compile o
+
     # `'x' * 2` => `'xx'`
     else if x instanceof Literal
       (q = (x.=compile o)charAt!) + "#{ x.slice 1 -1 }" * n + q
+
     # `"#{x}" * 2` => `(ref$ = "" + x) + ref$`
     else
       if n < 1 then return Block(x.it)add(Literal "''")compile o
@@ -2044,9 +2056,13 @@ class exports.Splat extends Node
   # node's compilation, than it's not in the right place
   compile: -> @carp 'invalid splat'
 
-  # expands a list of nodes mixed with splats to an array. Note that the
-  # return is _not_ an Arr (ast node). A caller can thus use the return value
-  # as arguments _or_ an array literal.
+  @hasSplats = (list) ->
+    expand list # XXX this mutates the caller's list, hope they don't mind...
+    for node in list
+      return true if node instanceof Splat
+    return false
+
+  # expands a list of nodes mixed with splats to an expression node.
   @expandArray = (list, apply) ->
     expand list
     index = 0
@@ -2054,8 +2070,8 @@ class exports.Splat extends Node
       break if node instanceof Splat
       ++index
 
-    # if there are no splats, return the original array (list)
-    return list if index >= list.length
+    if index >= list.length
+      throw new Error "compiler bug: expandArray called on list without splats!"
 
     unless list.length >= 2
       # the first and only element of the array is the splat
@@ -2064,9 +2080,9 @@ class exports.Splat extends Node
       # Function::apply can take array-like objects, but other
       # uses require 'slice' to turn array-likes to actual arrays
       if apply
-        return [list.0.it]
+        return list.0.it
       else # we need an array from array-likes (arguments)
-        return [ensureArray list.0.it]
+        return ensureArray list.0.it
 
     # we have multiple items, at least one of which is a splat
     # We turn compile the array as groups of non-splats (atoms)
@@ -2098,10 +2114,9 @@ class exports.Splat extends Node
         # e.g. [...a, ...b] = a.concat(b)
         args.shift!
 
-    c = Chain head
+    Chain head
       ..add Index Key \concat
       ..add Call args
-    return [c]
 
   # Compiles a list of nodes mixed with splats to a proper array.
   @compileArray = (o, list, apply) ->
