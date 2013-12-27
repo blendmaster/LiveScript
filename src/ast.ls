@@ -900,42 +900,65 @@ class exports.Obj extends List
 
   compileNode: (o) ->
     {items} = this
-    return (if @front then '({})' else '{}') unless items.length
-    code = ''; idt = \\n + o.indent += TAB; dic = {}
+
+    return (if @front then '({})' else '{}') unless items.length > 0
+
+    to-compile = []
     for node, i in items
-      if node.comment
-        code += idt + node.compile o
-        continue
-      node.=first if logic = node.getDefault!
+      # if node.comment
+      #  code += idt + node.compile o
+      #  continue
+
       if node instanceof Splat or (node.key or node) instanceof Parens
         rest = items.slice i
         break
-      if logic
-        # `{@a or b}` => `{a: @a or b}`
-        if node instanceof Prop
-        then node.val = logic <<< first: node.val
-        else node = Prop node, logic <<< first: node
-      if @deepEq and node instanceof Prop
-        if node.val instanceof Var and node.val.value is \_
-        then node.val = Obj [Prop (Key \__placeholder__), Literal true]
-        else if node.val instanceof [Obj, Arr] then node.val.deepEq = true
-      if multi then code += \, else multi = true
-      code += idt + if node instanceof Prop
-        {key, val} = node
-        if node.accessor
-          node.compileAccessor o, key.=compile o
-        else
-          val.ripName key
-          "#{ key.=compile o }: #{ val.compile o, LEVEL_LIST }"
       else
-        "#{ key = node.compile o }: #key"
-      # Canonicalize the key, e.g.: `0.0` => `0`
-      ID.test key or key = do Function "return #key"
-      node.carp "duplicate property \"#key\"" unless dic"#key." .^.= 1
-    code = "{#{ code and code + \\n + @tab }}"
+        to-compile.push node
+
     if rest
-      code = Import(JS code; Obj rest)compile o <<< indent: @tab
-    if @front and \{ is code.charAt! then "(#code)" else code
+      # compile import, making sure to force an import statement
+      # rather than gluing both objects back together
+      Import(Obj(to-compile) <<< {front: @front}, Obj(rest), false, true)
+        .compile o <<< indent: @tab
+    else
+      code = ''
+      idt = \\n + o.indent += TAB
+      dic = {}
+
+      for node in to-compile
+        node.=first if logic = node.getDefault!
+
+        if logic
+          # `{@a or b}` => `{a: @a or b}`
+          if node instanceof Prop
+          then node.val = logic <<< first: node.val
+          else node = Prop node, logic <<< first: node
+
+        if @deepEq and node instanceof Prop
+          if node.val instanceof Var and node.val.value is \_
+          then node.val = Obj [Prop (Key \__placeholder__), Literal true]
+          else if node.val instanceof [Obj, Arr] then node.val.deepEq = true
+
+        if multi then code += \, else multi = true
+
+        code += idt + if node instanceof Prop
+          {key, val} = node
+          if node.accessor
+            node.compileAccessor o, key.=compile o
+          else
+            val.ripName key
+            "#{ key.=compile o }: #{ val.compile o, LEVEL_LIST }"
+        else
+          "#{ key = node.compile o }: #key"
+
+        # Canonicalize the key, e.g.: `0.0` => `0`
+        ID.test key or key = do Function "return #key"
+
+        node.carp "duplicate property \"#key\"" unless dic"#key." .^.= 1
+
+      code = "{#{ code and code + \\n + @tab }}"
+
+      if @front and \{ is code.charAt! then "(#code)" else code
 
 #### Prop
 # `x: y`
@@ -1662,9 +1685,10 @@ class exports.Assign extends Node
 #### Import
 # Copies properties from right to left.
 class exports.Import extends Node
-  (@left, @right, @all and \All) ~>
+  (@left, @right, @all and \All, force-import = false) ~>
     if not all and left instanceof Obj and right.items
-      return Obj left.items ++ right.asObj!items
+      unless force-import
+        return Obj left.items ++ right.asObj!items
 
   children: <[ left right ]>
 
@@ -1698,21 +1722,28 @@ class exports.Import extends Node
         right = right.unfoldSoak   o
              or right.unfoldAssign o
              or right.expandSlice  o .unwrap!
-      return @compileAssign o, right.asObj!items if right instanceof List
+      if right instanceof List
+        return @compileAssign o, right.asObj!items
+
     Call.make Util("import#{ @all or '' }"), [@left, right] .compileNode o
 
   # If the right operand of `<<<` is an object or array literal,
   # expand it to a series of assignments.
   compileAssign: (o, items) ->
+
     return @left.compile o unless items.length
     top = not o.level
     if items.length < 2 and (top or @void or items.0 instanceof Splat)
       reft = @left
       reft = Parens reft if reft.isComplex!
-    else [left, reft, @temps] = @left.cache o
+    else
+      [left, reft, @temps] = @left.cache o
+
     [delim, space] = if top then [\; \\n + @tab] else [\, ' ']
     delim += space
+
     code = if @temps then left.compile(o, LEVEL_PAREN) + delim else ''
+
     for node, i in items
       i and code += if com then space else delim
       if com = node.comment
