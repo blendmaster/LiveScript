@@ -1050,8 +1050,8 @@ class exports.Arr extends List
     return nodes.0 if nodes.length is 1 and nodes.0 not instanceof Splat
     constructor nodes
 
-  # make array with input JS node assuming as splat
-  # TODO remove all cases of this
+  # turn input node into a splatted array, e.g. [...it], for
+  # destructuring rendArr use which expect Arr nodes.
   @wrap = -> constructor [Splat it <<< isArray: YES]
 
 #### Unary operators
