@@ -65,15 +65,18 @@ $ = require \./js
     # If flagged as `once`, the tempvar will be auto-freed.
     if once then [sub, ref <<< {+temp}] else [sub, ref, [ref.value]]
 
-  # Compiles to a variable/source pair suitable for looping.
-  compileLoopReference: (o, name, ret) ->
+  # caches to a variable/source pair suitable for looping.
+  # returns [ref, assign] if cached
+  # or [this] if we don't need caching
+  cacheLoopReference: (o, name, ret) ->
     if this instanceof Var   and o.scope.check @value
     or this instanceof Unary and @op in <[ + - ]> and -1/0 < +@it.value < 1/0
     or this instanceof Literal and not @isComplex!
-      return [@compile o] * 2
-    asn = Assign Var(tmp = o.scope.temporary name), this
-    ret or asn.void = true
-    [tmp; asn.compile o, if ret then LEVEL_CALL else LEVEL_PAREN]
+      return [this] # just the expr
+    else
+      asn = Assign Var(tmp = o.scope.temporary name), this
+      asn.void = true unless ret
+      return [Var tmp; asn]
 
   # Passes each child to a function, returning its return value if exists.
   eachChild: (fn) ->
@@ -387,6 +390,10 @@ class exports.Literal extends Atom
       else
         $.DebuggerStatement!
     | otherwise =>
+      # XXX @let replacement for `for let` loops
+      if @abused-by-let
+        return @let-abuse # already compiled
+
       if @abused
         val
       else
@@ -657,6 +664,7 @@ class exports.Chain extends Node
     @expandSlice o; @expandBind o; @expandSplat o; @expandStar o
 
     if @splatted-new-args
+      # TODO
       idt = o.indent + TAB
       func = Chain @head, tails.slice 0 -1
       return """
@@ -670,6 +678,18 @@ class exports.Chain extends Node
     # compile our flattened Chain node into nested JS AST expression nodes
     # we keep mutating the `js` variable to wrap the previous node
     # in the next Call/Member Expression,
+    #
+    # e.g.
+    #
+    # a.b.c
+    #
+    # compiles like:
+    #
+    # a
+    # =>
+    # {object: a, property: b}
+    # =>
+    # {object: {object: a, property: b}, property: c}
     js = @head.compile o
 
     for node in @tails
@@ -933,26 +953,6 @@ class List extends Node
   isEmpty : -> not @items.length
   assigns : -> for node in @items then return true if node.assigns it
 
-  @compile = (o, items, deepEq) ->
-    switch items.length
-    | 0 => return ''
-    | 1 => return items.0.compile o, LEVEL_LIST
-    {indent, level} = o
-    o <<< indent: indent + TAB, level: LEVEL_LIST
-    code  = items[i = 0]compile o
-    while items[++i]
-      code += ', '
-      target = that
-      if deepEq
-        if target instanceof Var and target.value is \_
-          target = Obj [Prop (Key \__placeholder__), Literal true]
-        else if target instanceof [Obj, Arr]
-          target.deepEq = true
-      code += target.compile o
-    code  = "\n#{o.indent}#code\n#indent" if ~code.indexOf \\n
-    o <<< {indent, level}
-    code
-
 #### Obj
 # `{x: y}`
 class exports.Obj extends List
@@ -1075,11 +1075,11 @@ class exports.Prop extends Node
     kind: if @accessor then "#{fun.x}et" else \init
 
   compileDescriptor: (o) ->
-    obj = Obj!
-    for fun in @val then obj.items.push Prop Key(fun.x + \et  ), fun
-    obj.items.push Prop Key(\configurable), Literal true
-    obj.items.push Prop Key(\enumerable  ), Literal true
-    obj.compile o
+    with Obj!
+      for fun in @val then ..items.push Prop Key(fun.x + \et  ), fun
+
+      ..items.push Prop Key(\configurable), Literal true
+      ..items.push Prop Key(\enumerable  ), Literal true
 
 #### Arr
 # `[x, y]`
@@ -1105,14 +1105,18 @@ class exports.Arr extends List
 
   compile: (o) ->
     {items} = this
-    return '[]' unless items.length
     # if there are splats to expand out
     if Splat.hasSplats items
-      code = Splat.expandArray(items, false)compile o
-
-      return if @newed then "(#code)" else code
+      Splat.expandArray(items, false)compile o
     else
-      "[#{ List.compile o, items, @deepEq }]"
+      $.ArrayExpression elements: for item in items
+        if @deepEq
+          if item instanceof Var and target.value is \_
+            item = Obj [Prop (Key \__placeholder__), Literal true]
+          else if item instanceof [Obj, Arr]
+            item.deepEq = true
+
+        item.compile o
 
   @maybe = (nodes) ->
     return nodes.0 if nodes.length is 1 and nodes.0 not instanceof Splat
@@ -1185,7 +1189,9 @@ class exports.Unary extends Node
     {op, it} = this
     switch op
     case \!   then it.cond = true
-    case \new then it.isCallable! or it.carp 'invalid constructor'
+    case \new
+      it.carp 'invalid constructor' unless it.isCallable!
+      return $.NewExpression callee: it.compile o, arguments: []
     case \do
       # `do f?` => `f?()`
       if o.level is LEVEL_TOP and it instanceof Fun and it.is-statement!
@@ -1202,17 +1208,23 @@ class exports.Unary extends Node
       if it instanceof Var and o.scope.checkReadOnly it.value
         @carp "#{ crement op } of #that \"#{it.value}\"" ReferenceError
       it{front} = this if @post
-    case \^^ then return "#{ util \clone }(#{ it.compile o, LEVEL_LIST })"
-    case \jsdelete then return "delete #{ it.compile o, LEVEL_LIST }"
+    case \^^
+      return
+        Call.make $.Identifier(name: util(\clone)), [it]
+          .compile o, LEVEL_LIST
+    case \jsdelete
+      return $.UnaryExpression operator: \delete, argument: it.compile o
     case \classof
-      return "#{ util \toString }.call(
-              #{ it.compile o, LEVEL_LIST }).slice(8, -1)"
-    code = it.compile o, LEVEL_OP + PREC.unary
-    if @post then code += op else
-      op += ' ' if op in <[ new typeof delete ]>
-                or op in <[ + - ]> and op is code.charAt!
-      code = op + code
-    if o.level < LEVEL_CALL then code else "(#code)"
+      # toString.call(it).slice(8, -1)
+      return Chain(Var util \toString)
+        .add Index Key \call
+        .add Call [it]
+        .add Index Key \slice
+        .add Call [Literal 8, Literal -1]
+
+    return $.UnaryExpression do
+      operator: op
+      argument: it.compile o, LEVEL_OP + PREC.unary
 
   # `^delete o[p, ...q]` => `[^delete o[p], ...^delete o[q]]`
   compileSpread: (o) ->
@@ -1231,17 +1243,21 @@ class exports.Unary extends Node
   # `v = delete o.k`
   compilePluck: (o) ->
     [get, del] = Chain @it .cacheReference o
-    code = "#{ ref = o.scope.temporary!  } = \
-            #{ get.compile o, LEVEL_LIST }, delete \
-            #{ del.compile o, LEVEL_LIST }, \
-            #{ o.scope.free ref }"
-    if o.level < LEVEL_LIST then code else "(#code)"
+
+    ref = o.scope.temporary!
+
+    # (ref$ = it[a], delete it[a], $ref)
+    Block [
+      Assign Var(ref), get
+      Unary \jsdelete del
+      Var(o.scope.free ref)
+    ] .compile o
 
   compileAsFunc: (o) ->
     if @op is \!
-    then util \not
-    else "(#{ (Fun [], Block Unary @op, Chain Var \it).compile o })"
-
+    then $.Identifier name: util \not
+    else
+      (Fun [], Block Unary @op, Chain Var \it).compile o
 
 #### Binary operators
 class exports.Binary extends Node
@@ -1333,10 +1349,13 @@ class exports.Binary extends Node
         and @first.isWhat! isnt @second.isWhat!
           console?.warn "WARNING: strict comparison of two different types will always be false: #{@first.value} == #{@second.value}"
       return @compileChain o if COMPARER.test @op and COMPARER.test @second.op
+
     @first <<< {@front}
-    code = "#{ @first .compile o, level = LEVEL_OP + PREC[@op] } #{@mapOp @op} \
-            #{ @second.compile o, level }"
-    if o.level <= level then code else "(#code)"
+
+    $.BinaryExpression do
+      operator: @mapOp @op
+      left : @first .compile i, LEVEL_OP + PREC[@op]
+      right: @second.compile i, LEVEL_OP + PREC[@op]
 
   mapOp: (op) ->
     | op.match //\.([&\|\^] | << | >>>?)\.// => that.1
@@ -1351,11 +1370,18 @@ class exports.Binary extends Node
   #
   # See <http://docs.python.org/reference/expressions.html#notin>.
   compileChain: (o) ->
-    code = @first.compile o, level = LEVEL_OP + PREC[@op]
     [sub, @second.first] = @second.first.cache o, true
-    code += " #{@op} #{ sub    .compile o, level    } && \
-                     #{ @second.compile o, LEVEL_OP }"
-    if o.level <= LEVEL_OP then code else "(#code)"
+
+    level = LEVEL_OP + PREC[@op]
+
+    # first `op` (ref$ = second) && ref$ `op` third
+    $.BinaryExpression do
+      operator: \&&
+      left: $.BinaryExpression do
+        left: @first.compile o, level
+        right: sub.compile o, level
+      right:
+        @second.compile o, LEVEL_OP
 
   compileExistence: (o) ->
     if @void or not o.level
@@ -1429,13 +1455,26 @@ class exports.Binary extends Node
 
     # `'x' * 2` => `'xx'`
     else if x instanceof Literal
-      (q = (x.=compile o)charAt!) + "#{ x.slice 1 -1 }" * n + q
+      Literal value: (q = (x.=compile o)charAt!) + "#{ x.slice 1 -1 }" * n + q
 
     # `"#{x}" * 2` => `(ref$ = "" + x) + ref$`
     else
-      if n < 1 then return Block(x.it)add(Literal "''")compile o
-      x = (refs = x.cache o, 1, LEVEL_OP)0 + " + #{refs.1}" * (n-1)
-      if o.level < LEVEL_OP + PREC\+ then x else "(#x)"
+      if n < 1
+        return Block(x.it)add(Literal "''")compile o
+      else
+        [sub, ref] = x.cache o, true # once
+
+        ident = $.Identifier name: ref
+
+        js = sub.compile o
+        # add ref n - 1 times by wrapping + BinaryExpressions
+        for i to n-1
+          js = $.BinaryExpression do
+            operator: \+
+            left: js
+            right: ident
+
+        return js
 
   compilePow: (o) ->
     # math.pow(first, second)
@@ -1471,10 +1510,28 @@ class exports.Binary extends Node
     Fun [], Block [n] .compile o
 
   compileMod: (o) ->
+    # (first % (ref$ = second) + ref$) % ref$
     ref = o.scope.temporary!
-    code = "((#{@first.compile o}) % (#ref = #{@second.compile o}) + #ref) % #ref"
+
+    ident = $.Identifier name: ref
+
+    js = $.BinaryExpression do
+      operator: \%
+      left: $.BinaryExpression do
+        operator: \+
+        left: $.BinaryExpression do
+          operator: \%
+          left: @first.compile o
+          right: $.AssignmentExpression do
+            operator: \=
+            left: $.Identifier name: ref
+            right: ident
+        right: ident
+      right: ident
+
     o.scope.free ref
-    code
+
+    js
 
   compilePartial: (o) ->
     vit = Var \it
@@ -1483,9 +1540,9 @@ class exports.Binary extends Node
       x = Var \x$; y = Var \y$
       (Fun [x, y], Block((Binary @op, x, y).invertCheck this), false, true).compile o
     case @first?
-      "(#{ (Fun [vit], Block((Binary @op, @first, vit) .invertCheck this)).compile o })"
+      (Fun [vit], Block((Binary @op, @first, vit) .invertCheck this)).compile o
     default
-      "(#{ (Fun [vit], Block((Binary @op, vit, @second).invertCheck this)).compile o })"
+      (Fun [vit], Block((Binary @op, vit, @second).invertCheck this)).compile o
 
   compileRegexEquals: (o, [regex, target]) ->
     if @op is \===
@@ -1572,31 +1629,62 @@ class exports.Assign extends Node
     (right.=unparen!)ripName left.=unwrap!
     sign = op.replace \: ''
 
-    name = (left <<< {+front})compile o, LEVEL_LIST
     if lvar = left instanceof Var
       if op is \=
-        o.scope.declare name, left,
-          (@const or not @defParam and o.const and \$ isnt name.slice -1)
-      else if o.scope.checkReadOnly name
-        left.carp "assignment to #that \"#name\"" ReferenceError
+        o.scope.declare left.name, left,
+          (@const or not @defParam and o.const and \$ isnt left.name.slice -1)
+      else if o.scope.checkReadOnly left.name
+        left.carp "assignment to #that \"#{left.name}\"" ReferenceError
+
+    # if we're assigning a function to an Index chain
+    # the `super` reference to the appropriate superclass method/static method
     if left instanceof Chain and right instanceof Fun
-      proto-split = name.split '.prototype.'
-      dot-split = name.split \.
-      if proto-split.length > 1
-        right.in-class = proto-split.0
-      else if dot-split.length > 1
-        right.in-class-static = dot-split[til -1].join ''
-    code = if not o.level and right instanceof While and not right.else and
-              (lvar or left instanceof Chain and left.isSimpleAccess!)
-      # Optimize `a = while ...`.
-      empty = if right.objComp then '{}' else '[]'
-      """#{ res = o.scope.temporary \res } = #empty;
-         #{@tab}#{ right.makeReturn(res)compile o }
-         #{@tab}#name #sign #{ o.scope.free res }"""
+      # find left-side of .prototype
+      proto-chain = Chain left.head
+      found-proto = false
+      for tail in left.tails
+        # all tails are Indices, not Calls
+        if tail.key instanceof Key and tail.key.name is \prototype
+          found-proto = true
+          break
+        else
+          proto-chain.add tail
+
+      if found-proto
+        # thing.prototype.method = -> super
+        # =>
+        # thing.prototype.method = -> thing.superclass.prototype.method
+        right.in-class = proto-chain
+      else
+        # thing.static-method = -> super
+        # =>
+        # thing.static-method = -> thing.superclass.static-method
+        #
+        # proto-chain is basically a copy of left, so just remove
+        # the last index
+        proto-chain.tails.pop!
+        right.in-class-static = proto-chain
+
+    if o.level is LEVEL_TOP and right instanceof While and not right.else and
+      (left instanceof Var or left instanceof Chain and left.isSimpleAccess!)
+
+      # Optimize `a = while ...` by not compiling a closure and instead
+      # doing statements
+      # res$ = {} or []
+      # while ...
+      #   res$.push ...
+      # left = res$
+      res = o.scope.temporary \res
+      Block [
+        Assign Var(res), if right.objComp then Obj! else Arr!
+        right.makeReturn(res)
+        Assign left, Var(o.scope.free res)
+      ] .compile o
     else
-      "#name #sign " + right.compile o, LEVEL_LIST
-    code = "(#code)" if o.level > LEVEL_LIST
-    code
+      $.AssignmentExpression
+        operator: sign
+        left: left.compile o
+        right: right.compile o, LEVEL_LIST
 
   compileConditional: (o, left) ->
     if left instanceof Var and @logic in <[ ? ]> and @op is \=
@@ -1629,7 +1717,9 @@ class exports.Assign extends Node
 
     if left.name
       # reuse the existing Var
-      cache = "#that = #{rite.compile o, r-compile-level}"
+      cache = Assign do
+        Var that
+        rite
       o.scope.declare left.name, left
       rite = Var left.name
     else if (ret or len > 1)
@@ -1639,17 +1729,21 @@ class exports.Assign extends Node
       if not is-literal and not is-var or assigned-by-left
         # can't use right, so assign temporary to it
         rref = o.scope.temporary!
-        cache = "#rref = #{rite.compile o, r-compile-level}"
+        cache = Assign do
+          Var rref
+          rite
         rite  = Var rref
 
+    # rendArr or rendObj
     list = @"rend#{ left.constructor.displayName }" o, items, rite
 
     o.scope.free rref  if rref
     list.unshift cache if cache
+
     if ret or not list.length
       list.push rite.compile o, r-compile-level
-    code = list.join ', '
-    if list.length < 2 or o.level < LEVEL_LIST then code else "(#code)"
+
+    $.SequenceExpression expressions: [..compile o, LEVEL_LIST for list]
 
   compileSplice: (o) ->
     [from-exp-node, from-exp] = Chain @left.from .cacheReference o
@@ -1743,7 +1837,7 @@ class exports.Assign extends Node
       if node instanceof Assign
         node = Binary node.op, node.left, node.right, (node.logic or true)
 
-      (this with {left: node, right: val, +void})compile o, LEVEL_PAREN
+      this with {left: node, right: val, +void}
 
   rendObj: (o, nodes, rite) ->
     for node in nodes
@@ -1769,7 +1863,7 @@ class exports.Assign extends Node
         rite = Parens rite, true # force parens
       val  = Chain rite, [Index key.maybeKey!]
       val  = Import Obj!, val if splat
-      (this with {left: node, right: val, +void})compile o, LEVEL_PAREN
+      this with {left: node, right: val, +void}
 
 #### Import
 # Copies properties from right to left.
@@ -1819,47 +1913,65 @@ class exports.Import extends Node
   # If the right operand of `<<<` is an object or array literal,
   # expand it to a series of assignments.
   compileAssign: (o, items) ->
-
     return @left.compile o unless items.length
-    top = not o.level
+
+    top = o.level is LEVEL_TOP
     if items.length < 2 and (top or @void or items.0 instanceof Splat)
       reft = @left
       reft = Parens reft if reft.isComplex!
     else
       [left, reft, @temps] = @left.cache o
+      reft = Var reft
 
     [delim, space] = if top then [\; \\n + @tab] else [\, ' ']
     delim += space
 
-    code = if @temps then left.compile(o, LEVEL_PAREN) + delim else ''
+    body = []
+    if @temps
+      body.push left
 
     for node, i in items
-      i and code += if com then space else delim
-      if com = node.comment
-        code += node.compile o
+      if node.comment
+        body.push node
         continue
       if node instanceof Splat
-        code += Import(reft, node.it)compile o
+        body.push Import(reft, node.it)
         continue
-      node.=first if logic = node.getDefault!
+
+      logic = node.getDefault!
+
+      node.=first if logic
+
       if dyna = node instanceof Parens
         [key, val] = node.it.cache o, true
       else if node instanceof Prop
         {key, val} = node
         if node.accessor
           key = Literal "'#{key.name}'" if key instanceof Key
-          code += "Object.defineProperty(#{ reft.compile o, LEVEL_LIST }
-                                       , #{ key .compile o, LEVEL_LIST }
-                                       , #{ node.compileDescriptor o })"
+          # Object.defineProperty(reft, key, descriptor)
+          node.push do
+            Chain Identifier \Object
+              .add Index Key \defineProperty
+              .add Call [
+                reft
+                key
+                node.compileDescriptor o
+              ]
           continue
+
       else key = val = node
       dyna  or  key.=maybeKey!
       logic and val = logic <<< first: val
-      code += Assign(Chain reft, [Index key]; val)compile o, LEVEL_PAREN
+
+      body.push Assign(Chain reft, [Index key]; val)
+
     return code if top
-    @void or node instanceof Splat or
-      code += (if com then ' ' else ', ') + reft.compile o, LEVEL_PAREN
-    if o.level < LEVEL_LIST then code else "(#code)"
+
+    # if we're returning, append left reference
+    if not @void and not node instanceof Splat
+      body.push reft
+
+    Block body .compile o
 
 #### In
 # Handles `in` operation that tests if the left operand is included within
@@ -1871,23 +1983,80 @@ class exports.In extends Node implements Negatable
 
   compileNode: (o) ->
     {items} = array = @array.expandSlice(o)unwrap!
+
+    # if not literal array or there's only one item
     if array not instanceof Arr or items.length < 2
-      return "#{ if @negated then \! else '' }#{ util \in }
-             (#{ @item.compile o, LEVEL_LIST }
-            , #{ array.compile o, LEVEL_LIST })"
-    code = ''
-    [sub, ref] = @item.cache o, false, LEVEL_PAREN
-    [cmp, cnj] = if @negated then [' !== ' ' && '] else [' === ' ' || ']
-    for test, i in items
-      code &&+= cnj
-      if test instanceof Splat
-        code += (new In(Var ref; test.it) <<< {@negated})compile o, LEVEL_TOP
-        code  = "(#sub, #code)" unless i or sub is ref
+      # in$(item, array)
+      js = $.CallExpression do
+        callee: $.Identifier util \in
+        arguments:
+          @item.compile o, LEVEL_LIST
+          array.compile o, LEVEL_LIST
+
+      if @negated # prepend '!'
+        js = $.UnaryExpression operator: \!, prefix: true, argument: js
+
+      return js
+    else
+      # a in [1 2 3]
+      # =>
+      # a === 1 || a === 2 || a === 3;
+      #
+      # or
+      #
+      # a not in [1 2 3]
+      # =>
+      # a !== 1 && a !== 2 && a !== 3;
+      #
+      # or
+      #
+      # a in [1, ...b]
+      # =>
+      # a === 1 || a in b
+
+      [cmp, cnj] = if @negated then [' !== ' ' && '] else [' === ' ' || ']
+
+      to-compile = items.slice!
+      first-test = to-compile.pop!
+
+      if @item.isComplex!
+        [sub, ref] = @item.cache o, false, LEVEL_PAREN
+
+        item-ref = $.Identifier name: ref
+
+        # start node with assignment of ref
+        # (ref$ = complex) === 1 || ref$ === 2 ...
+        js = $.BinaryExpression do
+          operator: cmp
+          left: sub.compile o
+          right: first-test.compile o
       else
-        code += (if i or sub is ref then ref else "(#sub)") +
-                cmp + test.compile o, LEVEL_OP + PREC\==
-    sub is ref or o.scope.free ref
-    if o.level < LEVEL_OP + PREC\|| then code else "(#code)"
+        # simple, use actual item
+        item-ref = @item.compile o
+
+        js = $.BinaryExpression do
+          operator: cmp
+          left: item-ref
+          right: first-test.compile o
+
+      # successively chain other comparisons
+      while (test = to-compile.pop!)
+        js = $.BinaryExpression do
+          operator: cnj
+          left: js # previous comparison
+          right: $.BinaryExpression do
+            operator: cmp
+            left: item-ref
+            right:
+              if test instanceof Splat
+                # compile utility function against inside of splat
+                (new In(item-ref; test.it) <<< {@negated})compile o, LEVEL_TOP
+              else
+                test.compile o, LEVEL_OP
+
+      o.scope.free ref if ref?
+
+      return js
 
 #### Existence
 # Checks a value for existence--not `undefined` nor `null`.
@@ -1898,13 +2067,33 @@ class exports.Existence extends Node implements Negatable
 
   compileNode: (o) ->
     node = @it.unwrap! <<< {@front}
-    code = node.compile o, LEVEL_OP + PREC\==
-    if node instanceof Var and not o.scope.check code, true
+
+    js-node = node.compile o, LEVEL_OP + PREC\==
+
+    if node instanceof Var and not o.scope.check node.name, true
       [op, eq] = if @negated then <[ || = ]> else <[ && ! ]>
-      code = "typeof #code #eq= 'undefined' #op #code #eq== null"
+
+      # typeof it != 'undefined' && it !== null
+      # or
+      # typeof it == 'undefined' || it === null
+      $.BinaryExpression do
+        operator: op
+        left: $.BinaryExpression do
+          operator: eq + \=
+          left: $.UnaryExpression do
+            operator: \typeof
+            argument: js-node
+          right: $.Literal value: 'undefined'
+        right: $.BinaryExpression do
+          operator: eq + \==
+          left: js-node
+          right: $.Literal value: null
     else
-      code += " #{ op = if @negated then \== else \!= } null"
-    if o.level < LEVEL_OP + PREC[op] then code else "(#code)"
+      # just compile to weak-equals null
+      $.BinaryExpression do
+        operator: if @negated then \== else \!=
+        left: js-node
+        right: $.Literal value: null
 
 #### Fun
 # A function definition. This is the only node that creates a `new Scope`.
@@ -1931,53 +2120,111 @@ class exports.Fun extends Node
 
   compileNode: (o) ->
     pscope = o.scope
+
     sscope = pscope.shared or pscope
+
     scope  = o.scope = @body.scope =
       new Scope (if @wrapper then pscope else sscope), @wrapper && sscope
+
     scope.fun = this
-    scope.assign \prototype "#{ that.compile o }.prototype" if @proto
-    scope.assign \constructor that                          if @cname
-    o.indent = @tab = '' if inLoop = delete o.loop
-    o.indent += TAB
-    {body, name, tab} = this
+
+    if @proto
+      scope.assign \prototype Chain @proto .add Index Key \prototype
+    if @cname
+      scope.assign \constructor Var @cname
+
+    inLoop = delete o.loop
+
+    {body, name} = this
+
+    # we don't know the context yet, so we can't make a
+    # FunctionDeclaration or FunctionExpression. once we know, we'll
+    # import this object into the actual node
+    js-fn = {}
+
     code = \function
     if @bound is \this$
       if @ctor
-        scope.assign \this$ 'this instanceof ctor$ ? this : new ctor$'
+        # var this$ = this instanceof ctor$ ? this : new ctor$
+        scope.assign \this$, with If!
+          ..if = Binary \instanceof Literal(\this), Var \ctor$
+          ..then = Literal \this
+          ..else = Unary \new Var \ctor$
+
         body.lines.push Return Var \this$
       else if sscope.fun?bound
       then @bound = that
-      else sscope.assign \this$ \this
+      else sscope.assign \this$ Literal \this
+
     if @statement
       name                    or @carp  'nameless function declaration'
       pscope is o.block.scope or @carp 'misplaced function declaration'
       @accessor              and @carp 'named accessor'
       pscope.add name, \function, this
+
     if @statement or name and @labeled
-      code += ' ' + scope.add name, \function, this
-    @hushed or @ctor or @newed or body.makeReturn!
-    code += "(#{ @compileParams o, scope }){"
-    code += "\n#that\n#tab" if body.compileWithDeclarations o
-    code += \}
-    curry-code-check = ~>
-      if @curried and @has-splats
-          @carp 'cannot curry a function with a variable number of arguments'
+      scope.add name, \function, this
+      js-fn.id = $.Identifier {name}
+
+    body.makeReturn! unless @hushed or @ctor or @newed
+
+    js-fn.params = @compileParams o, scope
+    js-fn.body = body.compileWithDeclarations o
+
+    if @curried and @has-splats
+        @carp 'cannot curry a function with a variable number of arguments'
+
+    # if curried, wrap function expression in call
+    curry-code-check = (force-expr) ~>
       if @curried and @params.length > 1 and not @class-bound
-        "#{ util \curry }" + if @bound
-          "((#code), true)"
+        # wrap in curry$(function () {...}, bound)
+        js = $.FunctionExpression js-fn
+        $.CallExpression do
+          callee: $.Identifier name: util \curry
+          arguments:
+            if @bound then [js, $.Literal value: true] else [js]
+      else
+        if force-expression or not @statement
+          $.FunctionExpression js-fn
         else
-          "(#code)"
-      else code
-    if inLoop then return pscope.assign pscope.temporary(\fn), curry-code-check!
+          $.FunctionDeclaration js-fn
+
+    if inLoop
+      # initialize function in VariableDeclarator
+      # and use the temp variable in its place
+      # force expression for non-currying cases, since it's in assignment
+      return pscope.assign pscope.temporary(\fn), curry-code-check(true)
+
     if @returns
-      code += "\n#{tab}return #name;"
+      # we're in a statement context so wrap in $.BlockStatement so
+      # we can add the extra return
+      $.BlockStatement body:
+        * $.FunctionDeclaration js-fn
+        * $.ReturnStatement argument: $.Identifier {name}
     else if @bound and @ctor
-      code += ' function ctor$(){} ctor$.prototype = prototype;'
-    code = curry-code-check!
-    if @front and not @statement then "(#code)" else code
+      # also in statement context, so add bound ctor definition
+      #
+      # function ctor$(){} ctor$.prototype = prototype;
+      $.BlockStatement body:
+        * $.FunctionDeclaration js-fn
+        * $.FunctionDeclaration do
+            id: $.Identifier name: \ctor$
+            arguments: []
+            body: $.BlockStatement body: []
+        * $.AssignmentExpression do
+            operator: \=
+            left: $.MemberExpression do
+              computed: false
+              object: $.Identifier name: \ctor$
+              property: $.Identifier name: \prototype
+            right:
+              $.Identifier name: \prototype
+    else
+      curry-code-check!
 
   compileParams: (o, scope) ->
     {{length}:params, body} = this
+
     # Remove trailing placeholders.
     for p in params by -1
       break unless p.isEmpty! or p.filler
@@ -1989,6 +2236,7 @@ class exports.Fun extends Node
       # `(a = x) ->` => `(a ? x) ->`
       else if p.op is \=
         params[i] = Binary (p.logic or \?), p.left, p.right
+
     # `(a, ...b, c) ->` => `(a) -> [[] ...b, c] = @@`
     if splace?
       rest = params.splice splace, 9e9
@@ -2022,12 +2270,16 @@ class exports.Fun extends Node
           vr = v
         else if df
           assigns.push Assign vr, p.second, \=, p.op, true
+
         names.push scope.add vr.value, \arg, p
+
     if rest
       while splace-- then rest.unshift Arr!
       assigns.push Assign Arr(rest), Literal \arguments
+
     @body.prepend ...assigns if assigns.length
-    names.join ', '
+
+    return [$.Identifier {name} for name in names]
 
 #### Class
 class exports.Class extends Node
@@ -2150,17 +2402,45 @@ class exports.Super extends Node
   isCallable: YES
 
   compile: ({scope}:o) ->
-    unless @sproto
+    if @sproto
+      $.Identifier name: \superclass
+    else
       while not scope.get \superclass and scope.fun, scope.=parent
         result = that
-        return \superclass.prototype + Index that .compile o if result.meth
-        return \superclass           + Index that .compile o if result.stat
-        if scope.fun.in-class
-          return "#that.superclass.prototype.#{scope.fun.name}"
+
+        if result.meth
+          # superclass.prototype[that]
+          return Chain Var \superclass
+            .add Index Key \prototype
+            .add Index that
+            .compile o
+        else if result.stat
+          # superclass[that]
+          return Chain Var \superclass
+            .add Index that
+            .compile o
+        else if scope.fun.in-class
+          # that.superclass.prototype.<name>
+          return Chain that
+            .add Index Key \superclass
+            .add Index Key \prototype
+            .add Index Key scope.fun.name
+            .compile o
         else if scope.fun.in-class-static
-          return "#that.superclass.#{scope.fun.name}"
-      return "#that.superclass" if o.scope.fun?name
-    \superclass
+          # that.superclass.<name>
+          return Chain that
+            .add Index Key \superclass
+            .add Index Key scope.fun.name
+            .compile o
+
+      if o.scope.fun?name
+        # that.superclass
+        Chain Var that
+          .add Index Key \superclass
+          .compile o
+      else
+        # couldn't find anything, just emit `superclass`
+        $.Identifier name: \superclass
 
 #### Parens
 # An extra set of parentheses,
@@ -2185,8 +2465,12 @@ class exports.Parens extends Node
     unless @keep or @newed or level >= LEVEL_OP + PREC[it.op]
       return (it <<< {@front})compile o, level || LEVEL_PAREN
     if it.isStatement!
-    then it.compileClosure o
-    else "(#{ it.compile o, LEVEL_PAREN })"
+      it.compileClosure o
+    else
+      # since we're working with JS AST nodes directly, we
+      # don't need to clarify order of operations, so this is just
+      # a passthrough compilation
+      it.compile o, LEVEL_PAREN
 
 #### Splat
 # A splat, either as an argument to a call
@@ -2301,10 +2585,15 @@ class exports.Jump extends Node
     return that not in (ctx.labels ?= []) and this if @label
 
   compileNode: (o) ->
-    if @label
-    then that in (o.labels ?= []) or @carp "unknown label \"#that\""
-    else o[@verb]          or @carp "stray #{@verb}"
-    @show! + \;
+    if @label and not @label in (o.labels ?= [])
+      @carp "unknown label \"#that\""
+    else if not o[@verb]
+      @carp "stray #{@verb}"
+
+    if @verb is \break
+      $.BreakStatement {@label}
+    else
+      $.ContinueStatement {@label}
 
   @extended = !(sub) ->
     sub::children = [\it]
@@ -2316,13 +2605,18 @@ class exports.Throw extends Jump
 
   getJump: VOID
 
-  compileNode: (o) -> "throw #{ @it?compile o, LEVEL_PAREN or \null };"
+  compileNode: (o) ->
+    $.ThrowStatement argument: @it?compile o, LEVEL_PAREN or \null
 
 #### YadaYadaYada
 # `...` indicates unimplementedness.
 class exports.YadaYadaYada extends Throw
   ~>
-  compileNode: (o) -> "throw Error('unimplemented');"
+  compileNode: (o) ->
+    # throw Error('unimplemented');
+    $.ThrowStatement argument: $.CallExpression do
+      callee: $.Identifier \Error
+      arguments: [$.Literal value: \unimplemented]
 
 #### Return
 class exports.Return extends Jump
@@ -2331,7 +2625,7 @@ class exports.Return extends Jump
   getJump: THIS
 
   compileNode: (o) ->
-    "return#{ if @it then ' ' + that.compile o, LEVEL_PAREN else '' };"
+    $.ReturnStatement argument: @it?compile o, LEVEL_PAREN
 
 #### While
 # The traditional `while`/`for`/`do` loop.
@@ -2339,6 +2633,7 @@ class exports.Return extends Jump
 class exports.While extends Node
   (test, @un, mode) ->
     mode and if mode instanceof Node then @update = mode else @post = true
+
     # `while true` `until false` => `for (;;)`
     if @post or test.value is not ''+!un then import {test}
 
@@ -2393,58 +2688,116 @@ class exports.While extends Node
 
   compileNode: (o) ->
     o.loop = true
-    @test and if @un then @test.=invert! else @anaphorize!
-    return 'do {' + @compileBody (o.indent += TAB; o) if @post
-    test = @test?compile o, LEVEL_PAREN or ''
-    unless @update or @else
-      head = if test then "while (#test" else 'for (;;'
-    else
-      head = 'for ('
-      head += "#{ @yet = o.scope.temporary \yet } = true" if @else
-      head += ";#{ test and ' ' + test };"
-      head += ' ' + that.compile o, LEVEL_PAREN if @update
-    head + ') {' + @compileBody (o.indent += TAB; o)
 
-  compileBody: (o) ->
-    o.break = o.continue = true
-    {body: {lines}, yet, tab} = this
-    code = ret = mid = ''
-    empty = if @objComp then '{}' else '[]'
-    last = lines?[*-1]
-    unless (@is-comprehension or @in-comprehension) and not last?is-comprehension
-      var has-loop
-      last?traverseChildren !-> if it instanceof Block and it.lines[*-1] instanceof While
-        has-loop := true
-      if @returns and not @res-var
-        @res-var = res = o.scope.assign \results$ empty
-      if @res-var and (last instanceof While or has-loop)
-        temp = o.scope.temporary \lresult
-        lines.unshift Assign (Var temp), Arr!, \=
-        lines[*-1]?=makeReturn temp
-        mid += "#TAB#{Chain Var @res-var
-          .add Index (Key \push), \., true
-          .add Call [Chain Var temp] .compile o };\n#{@tab}"
+    if @else
+      @yet = o.scope.temporary \yet
+
+    js =
+      if @test and not (@update or @else)
+        if @post
+          $.DoWhileStatement test: test.compile o, LEVEL_PAREN
+        else
+          $.WhileStatement   test: test.compile o, LEVEL_PAREN
       else
-        @has-returned = true
-        if @res-var
-          @body.makeReturn @res-var
-    if @returns
-      @body = Block @body.makeObjReturn \results$ if @objComp
-      @body = If @guard, @body if @guard and @objComp
-      if (not last instanceof While and not @has-returned) or @is-comprehension or @in-comprehension
-        lines[*-1]?=makeReturn res = o.scope.assign \results$ empty
-      ret += "\n#{@tab}return #{ res or empty };"
-      @else?makeReturn!
-    if yet
-      code += "\n#yet = false;\n"
-    code += "\n#that\n#tab" if @body.compile o, LEVEL_TOP
-    code += mid
-    code += \}
-    code += " while (#{ @test.compile o<<<{tab} LEVEL_PAREN });" if @post
-    if yet
-      code += " if (#yet) #{ @compileBlock o, Block @else }"
-      o.scope.free yet
-    code + ret
+        # compile to for(;;) due to logic in constructor that removes
+        # @test if it's (while true) or (until false)
+        if not @test
+          $.ForStatement init: null, test: null, update: null
+        else
+          $.ForStatement do
+            # yet = true in initialization
+            init: if @else
+              $.AssignmentExpression do
+                operator: \=
+                left: $.Identifier name: @yet
+                right: $.Literal value: true
+            test: test.compile o, LEVEL_PAREN
+            update: if @update then that.compile o, LEVEL_PAREN
+
+      @compileBody o, js
+
+    # js is containing DoWhile/While/ForStatement
+    # which has its `body` set and is possibly wrapped
+    # in other statements to add behavior
+    compileBody: (o, js) ->
+      o.break = o.continue = true
+
+      {body: {lines}, yet} = this
+
+      mid = void
+      ret = void
+
+      empty = if @objComp then Obj! else Arr!
+
+      last = lines?[*-1]
+
+      unless (@is-comprehension or @in-comprehension) and not last?is-comprehension
+        var has-loop
+        last?traverseChildren !->
+          if it instanceof Block and it.lines[*-1] instanceof While
+            has-loop := true
+
+        if @returns and not @res-var
+          @res-var = res = o.scope.assign \results$ empty
+
+        if @res-var and (last instanceof While or has-loop)
+          temp = o.scope.temporary \lresult
+
+          lines.unshift Assign (Var temp), Arr!, \=
+
+          lines[*-1]?=makeReturn temp
+
+          mid = do
+            Chain Var @res-var
+              .add Index (Key \push), \., true
+              .add Call [Chain Var temp]
+        else
+          @has-returned = true
+          if @res-var
+            @body.makeReturn @res-var
+
+      if @returns
+        @body = Block @body.makeObjReturn \results$ if @objComp
+        @body = If @guard, @body if @guard and @objComp
+        if (not last instanceof While and not @has-returned) or
+           @is-comprehension or @in-comprehension
+
+          lines[*-1]?=makeReturn res = o.scope.assign \results$ empty
+
+        ret = $.ReturnStatement argument: (res or empty)compile o
+
+        @else?makeReturn!
+
+      if yet
+        @body.prepend Assign Var(yet), Literal \false
+
+      # add push to res as last statement in body if present
+      @body.add mid if mid?
+
+      js.body = @body.compile o, LEVEL_TOP
+
+      # compile else as separate if statement
+      if yet
+        js = $.BlockStatement body:
+          * js # while/for statement
+          * $.IfStatement do
+              test: $.Identifier name: yet
+              consequent: @compileBlock o, Block @else
+        o.scope.free yet
+
+      # add return statement if present
+      if ret
+        # avoid wrapping blockstatement in another statement
+        # the Block.compile strategy will take care of unwrapping
+        # top-level BlockStatements, but not nested ones
+        if js instanceof $.BlockStatement
+          js.push ret
+        else
+          js = $.BlockStatement body:
+            * js # while/for
+            * ret
+
+      return js
 
 #### For
 # LiveScript's replacements for the `for` loop are array, object or range iterators.
@@ -2486,78 +2839,315 @@ class exports.For extends While
 
   compileNode: (o) ->
     o.loop = true
-    temps = @temps = []
-    if @object and @index
-    then o.scope.declare idx = @index
-    else temps.push idx = o.scope.temporary \i
-    @addBody Block Var idx if not @body
-    unless @object
-      [pvar, step] = (@step or Literal 1)compileLoopReference o, \step
-      pvar is step or temps.push pvar
-    if @from
-      [tvar, tail] = @to.compileLoopReference o, \to
-      fvar = @from.compile o, LEVEL_LIST
-      vars = "#idx = #fvar"
-      unless tail is tvar
-        vars += ", #tail"
-        temps.push tvar
-      pvar = step = -1 if not @step and +fvar > +tvar
-      eq   = if @op is \til then '' else \=
-      cond = if +pvar
-        then "#idx #{ '<>'charAt pvar < 0 }#eq #tvar"
-        else "#pvar < 0 ? #idx >#eq #tvar : #idx <#eq #tvar"
+    @temps = []
+
+    if @else
+      @yet = o.scope.temporary \yet
+
+    js = if @object?
+      @compileForOfLoop o
+    else if @to?
+      @compileToFromLoop
     else
-      @item = Var o.scope.temporary \x if @ref
-      if @item or @object and @own
-        [svar, srcPart] = @source.compileLoopReference o, \ref, not @object
-        svar is srcPart or temps.push svar
-      else
-        svar = srcPart = @source.compile o, LEVEL_PAREN
-      unless @object
-        if 0 > pvar and ~~pvar is +pvar  # negative int
-          vars = "#idx = #srcPart.length - 1"
-          cond = "#idx >= 0"
-        else
-          temps.push lvar = o.scope.temporary \len
-          vars = "#idx = 0, #lvar = #srcPart.length"
-          cond = "#idx < #lvar"
-    @else and @yet = o.scope.temporary \yet
-    head = 'for ('
-    head += "#idx in " if @object
-    head += "#that = true, " if @yet
-    if @object
-      head += srcPart
-    else
-      step is pvar or vars += ', ' + step
-      head += "#vars; #cond; " + if 1 ~= Math.abs pvar
-        then (if pvar < 0 then \-- else \++) + idx
-        else idx + if pvar < 0
-          then ' -= ' + pvar.slice 1
-          else ' += ' + pvar
-    @own and head += ") if (#{ o.scope.assign \own$ '{}.hasOwnProperty' }
-                            .call(#svar, #idx)"
-    head += ') {'
+      @compileForLoop o
+
+  # object loop
+  compileForOfLoop: (o) ->
+    # for @index, @item of @source then @body
+
+    # make sure index (field name) is in scope
+    o.scope.declare @index
+
+    if @item and not @item.isEmpty!
+      # cache @source if it's complex e.g.
+      #
+      # for k, v in get-obj() then ...
+      # =>
+      # for (k in (ref = get-obj())) {
+      #   v = ref[k]
+      #   ...
+      # }
+      [svar, src-assign] = @source.cacheLoopReference o, \ref, not @object
+      if src-assign?
+        @temps.push svar.name
+
+      # @item = svar[idx] at beginning of body
+      @body.prepend Assign do
+        @item,
+        Chain svar .add Index(Var(idx)) # svar[idx]
+
     if @let
+      # desugaring of `for let` is done somewhere upstream, so
+      # all we have to do is replace the placeholder variables
+      # with the actual temporary names we have
+      # XXX this is an abuse of the Literal AST node
       @body.traverseChildren !->
         switch it.value
-        | \index$$ => it.value = idx
-        | \item$$  => it.value = "#svar[#idx]"
-    o.indent += TAB
-    if @index and not @object
-      head += \\n + o.indent +
-        Assign(Var @index; Var idx).compile(o, LEVEL_TOP) + \;
-    if @item and not @item.isEmpty!
-      head += \\n + o.indent
-      head +=
-        Assign(
-          @item,
-          Chain Var(svar) .add Index(Var(idx)) # svar[idx]
-        )compile(o, LEVEL_TOP)
-      head += \;
+        | \index$$ =>
+          it.abused-by-let = true
+          it.let-abuse = $.Identifier name: @index
+        # item$$ only exists if @item exists and thus svar is defined
+        | \item$$  =>
+          it.abused-by-let = true
+          # svar[idx]
+          it.let-abuse = $.MemberExpression do
+            computed: true
+            object: svar.compile o
+            property: $.Identifier name: @index
+
+    right = (if src-assign? then that else @source).compile o, LEVEL_LIST
+    if @yet
+      # set yet$ to true in in 'initializer' e.g.
+      # for (i in (yet$ = true, obj)) { ... }
+      # so if there are no properties, the `else` block runs
+      right = $.SequenceExpression expressions:
+        * $.AssignmentExpression do
+            operator: \=
+            left: $.Identifier name: @yet
+            right: $.Literal value: true
+        * right # actual `right`
+
+    js = $.ForInStatement do
+      left:  @index.compile o, LEVEL_LIST
+      right: right
+
+    # node that desurgaring of `let` scoping as a function
+    # and `when` guards is done already, so we just have to
+    # compile the body.
+    @compileBody o, js
+
+  # indicies loop
+  compileToFromLoop: (o) ->
+    # for @index from @from @op(til/to) @to by @step then @body
+
+    # @from is optional but is set to (Literal 0) by the parser/lexer if
+    # missing from the source, so it's always there at this point
+
+    # @step is optional, null if unspecified
+
+    # body is optional e.g.
+    # [i til 2] => [i$ for i$ from i til 2]
+
+    @addBody Block Var idx if not @body
+
+    inits   = Block!
+    updates = Block!
+
+    idx = o.scope.temporary \i
+    @temps.push idx
+    inits.add Assign (Var idx), @from
+
+    if @yet
+      # set yet$ to true in in 'initializer'
+      # so if loop body never executes, the `else` block runs
+      inits.add Assign (Var @yet), Literal \true
+
+    [to-var, to-init] = @to.cacheLoopReference o, \to
+    if to-init? # it was complex
+      inits.add to-init
+      @temps.push to-var.name
+
+    if @step?
+      [step-var, step-init] = @step.cacheLoopReference o, \step
+      if step-init? # it was complex
+        inits.add step-init
+        @temps.push step-var.name
+
+    test =
+      if @step?
+        step-number = parse-number @step
+        if not Number.isNaN step-number
+          # step is a literal number, just determine sign
+
+          # <, >, >=, <=
+          op = (if step-number >= 0 then '<' else '>') \
+             + (if @op is \to then \= else '')
+
+          $.BinaryExpression do
+            operator: op
+            left: $.Identifier name: idx
+            right: to-var.compile o
+        else
+          # dynamically determine sign
+          #
+          # for a til b by step
+          #
+          # =>
+          #
+          # for (i$ = a, $to = b, step$ = step;
+          #      $step < 0 ? i$ > $to : i$ < to$
+          #      ; i$ += step$) ...
+
+          op-add = if @op is \to then \= else ''
+
+          $.ConditionalExpression do
+            test: $.BinaryExpresion do
+              operator: '<'
+              left: step-var.compile o
+              right: $.Literal value: 0
+            consequent: $.BinaryExpresion do
+              operator: '>' + op-add
+              left: $.Identifier name: idx
+              right: to-var.compile o
+            test: $.BinaryExpresion do
+              operator: '<' + op-add,
+              left: $.Identifier name: idx
+              right: to-var.compile o
+      else if not Number.isNaN (from-no = parse-number @from)
+      and     not Number.isNaN (to-no   = parse-number @to)
+        # both to and from are number literals, determine sign
+        op = (if from-no < to-no then '<' else '>') \
+           + (if @op is \to then \= else '')
+
+        $.BinaryExpression do
+          operator: op
+          left: $.Identifier name: idx
+          right: to-var.compile o
+      else
+        # assume @to is greater than @a
+        $.BinaryExpression do
+          operator: '<'
+          left: $.Identifier name: idx
+          right: to-var.compile o
+
+    update =
+      if @step
+        $.AssignmentExpression do
+          operator: \+=
+          left: $.Identifier name: idx
+          right: step-var.compile o
+      else if not Number.isNaN (from-no = parse-number @from)
+      and     not Number.isNaN (to-no   = parse-number @to)
+        $.UpdateExpression do
+          prefix: true
+          operator: if from-no < to-no then '++' else '--'
+          argument: $.Identifier name: idx
+      else
+        # assume from < to
+        $.UpdateExpression do
+          prefix: true
+          operator: \++
+          argument: $.Identifier name: idx
+
+    if @let
+      # desugaring of `for let` is done somewhere upstream, so
+      # all we have to do is replace the placeholder variables
+      # with the actual temporary names we have
+      # XXX this is an abuse of the Literal AST node
+      @body.traverseChildren !->
+        switch it.value
+        | \index$$ =>
+          it.abused-by-let = true
+          it.let-abuse = $.Identifier name: @index
+
+    js = $.ForStatement do
+      init: inits.compile o, LEVEL_LIST
+      test: test
+      update: update
+
+    @compileBody o, js
+
+  compileForInLoop: (o) ->
+    # for @item, @index in @source by @step then @body
+    # @index is optional
+    #
+    # @item is also optional, in which case @ref is true e.g.
+    #
+    #     for stuff then ..member
+    #
+
+    inits = Block!
+
+    idx = o.scope.temporary \i
+    @temps.push idx
+    inits.add Assign (Var idx), @from
+
+    if @yet
+      # set yet$ to true in in 'initializer'
+      # so if loop body never executes, the `else` block runs
+      inits.add Assign (Var @yet), Literal \true
+
+    len = o.scope.temporary \len
+    @temps.push len
+
+    if @ref?
+      @item = Var o.scope.temporary \x
+
+    [source-var, source-init] = @source.cacheLoopReference o, @source
+    if source-init? # it was complex
+      # len$ = ($ref = source).length
+      inits.add Assign (Var len), Chain source-init, Index Key \length
+      @temps.push source-var.name
+    else
+      # len$ = source.length
+      inits.add Assign (Var len), Chain @source, Index Key \length
+
+    if @step?
+      [step-var, step-init] = @step.cacheLoopReference o, \step
+      if step-init? # it was complex
+        inits.add step-init
+        @temps.push step-var.name
+
+    test = $.BinaryExpression do
+      operator: '<'
+      left: $.Identifier name: idx
+      right: $.Identifier name: len
+
+    update =
+      if @step?
+        $.AssignmentExpression do
+          operator: '+='
+          left: $.Identifier name: idx
+          right: step-var
+      else
+        $.UpdateExpression do
+          prefix: true
+          operator: '++'
+          argument: $.Identifier name: idx
+
+    if @index?
+      @body.add Assign (Var @index), Var idx
+
+    if @item? and not @item.isEmpty!
+      @body.add Assign @item,
+        Chain Var(svar) .add Index(Var(idx)) # svar[idx]
+
+    # set scope's cascade ref to the temp var if present
     o.ref = @item.value if @ref
-    body  = @compileBody o
-    head += \\n + @tab if (@item or (@index and not @object)) and \} is body.charAt 0
-    head + body
+
+    if @let
+      # desugaring of `for let` is done somewhere upstream, so
+      # all we have to do is replace the placeholder variables
+      # with the actual temporary names we have
+      # XXX this is an abuse of the Literal AST node
+      @body.traverseChildren !->
+        switch it.value
+        | \index$$ =>
+          it.abused-by-let = true
+          it.let-abuse = $.Identifier name: @index
+        # item$$ only exists if @item exists and thus source-var is defined
+        | \item$$  =>
+          it.abused-by-let = true
+          # source[idx]
+          it.let-abuse = $.MemberExpression do
+            computed: true
+            object: source-var.compile o
+            property: $.Identifier name: @index
+
+    js = $.ForStatement do
+      init: inits.compile o, LEVEL_LIST
+      test: test
+      update: update
+
+    @compileBody o, js
+
+  parse-number = (node) ->
+    if node instanceof Literal
+      parseFloat @step.value
+    else if @step instanceof Unary
+    and @step.op is \-
+    and @step.it instanceof Literal
+      -(parseFloat @step.it.value)
 
 #### Try
 # Classic `try`-`catch`-`finally` block with optional `catch`.
@@ -2581,15 +3171,31 @@ class exports.Try extends Node
     this
 
   compileNode: (o) ->
-    o.indent += TAB
-    code = 'try ' + @compileBlock o, @attempt
-    if @recovery? or not @ensure
-      if not @recovery?
-        @recovery = Block [] # empty
-      code += ' catch (e$) ' + @compileBlock o, @recovery
-    if @ensure
-      code += ' finally '    + @compileBlock o, that
-    code
+    # try { @attempt } catch (@thrown) { @recovery } finally { @ensure }
+
+    # @recovery is optional, defaulting to empty block
+    # @ensure is optional, just like the `finally` clause
+
+    # we need at least either a finally or a catch block,
+    # so create empty catch if neither are present
+    if not @recovery? and not @ensure?
+      @recovery = Block []
+
+    $.TryStatement do
+      block: @compileBlock o, @attempt
+
+      # JS AST supports multiple handlers, so we use an array
+      handlers:
+        if @recovery
+          [$.CatchClause do
+             # if there's a specified throw param, it's assigned
+             # in the @recovery body by the constructor logic
+             param: $.Identifier name: \e$
+             body: @compileBlock o, @recovery]
+        else
+          []
+
+      finalizer: if @ensure? then @compileBlock o, @ensure
 
 #### Switch
 # Compiles to the regular js `switch`-`case`-`default`,
@@ -2633,20 +3239,33 @@ class exports.Switch extends Node
   compileNode: (o) ->
     {tab} = this
     [target-node, target] = Chain @target .cacheReference o if @target
+
     topic = if @type is \match
       t = if target then [target-node] else []
       Block (t ++ [Literal \false]) .compile o, LEVEL_PAREN
     else
       !!@topic and @anaphorize!compile o, LEVEL_PAREN
-    code  = "switch (#topic) {\n"
+
     stop  = @default or @cases.length - 1
+
     o.break = true
+
+    js-cases = []
+    # flatten compiled cases
     for c, i in @cases
-      code += c.compileCase o, tab, i is stop, (@type is \match or !topic), @type, target
+      js-cases.push ...c.compileCase do
+        o, tab, i is stop, (@type is \match or !topic), @type, target
+
     if @default
-      o.indent = tab + TAB
-      code += tab + "default:\n#that\n" if @default.compile o, LEVEL_TOP
-    code + tab + \}
+      js-cases.push do
+        # test: null means `default`, confusingly enough
+        $.SwitchCase do
+          test: null
+          consequent: @default.compile o, LEVEL_TOP
+
+    $.SwitchStatement do
+      discriminant: topic
+      cases: js-cases
 
 #### Case
 class exports.Case extends Node
@@ -2660,24 +3279,34 @@ class exports.Case extends Node
     @body.makeReturn it unless @body.lines[*-1]?value is \fallthrough
     this
 
+  # a single LiveScript Case can compile to multple
+  # JS cases, so this returns an array of $.SwitchCase
   compileCase: (o, tab, nobr, bool, type, target) ->
     tests = []
     for test in @tests
       test.=expandSlice(o)unwrap!
       if test instanceof Arr and type isnt \match
         for t in test.items then tests.push t
-      else tests.push test
-    tests.length or tests.push Literal \void
+      else
+        tests.push test
+
+    if tests.length is 0
+      tests.push Literal \void
+
     if type is \match
       for test, i in tests
         tar = Chain target .add Index (Literal i), \., true
         tests[i] = Chain test .auto-compare (if target then [tar] else null)
+
     if bool
       binary = if type is \match then \&& else \||
       [t] = tests; i = 0; while tests[++i] then t = Binary binary, t, that
       tests = [(@<<<{t, aSource: \t, aTargets: [\body]})anaphorize!invert!]
-    code = ''
-    for t in tests then code += tab + "case #{ t.compile o, LEVEL_PAREN }:\n"
+
+    [..., last-case] = js-cases =
+      for t in tests
+        $.SwitchCase test: t.compile o, LEVEL_PAREN
+
     {lines} = @body; last = lines[*-1]
 
     ft = last?value is \fallthrough
@@ -2686,10 +3315,15 @@ class exports.Case extends Node
     # compiling a dummy variable
     lines.pop! if ft
 
-    o.indent = tab += TAB
-    code += that + \\n        if @body.compile o, LEVEL_TOP
-    code += tab  + 'break;\n' unless nobr or ft or last instanceof Jump
-    code
+    # unless force no-break, or fallthrough, or an explicit jump
+    unless nobr or ft or last instanceof Jump
+      # add break statement
+      @body.add Jump \break
+
+    # compile body to last case
+    last-case.consequent = @body.compile o, LEVEL_TOP
+
+    return js-cases
 
 #### If
 # The `if`/`else` structure that acts as both statement and expression.
@@ -2719,31 +3353,35 @@ class exports.If extends Node
 
   compileNode: (o) ->
     if @un then @if.=invert! else @soak or @anaphorize!
-    if o.level then @compileExpression o else @compileStatement o
+
+    if o.level is LEVEL_TOP
+      @compileExpression o
+    else
+      @compileStatement o
 
   compileStatement: (o) ->
-    code = "if (#{ @if.compile o, LEVEL_PAREN }) "
-    o.indent += TAB
-    code += @compileBlock o, Block @then
-    return code unless els = @else
-    code + ' else ' + if els instanceof constructor
-      then els.compile o <<< indent: @tab, LEVEL_TOP
-      else @compileBlock o, els
+    $.IfStatement do
+      test:       @if  .compile o, LEVEL_PAREN
+      consequent: @then.compile o, LEVEL_TOP
+      alternate:  @else?compile o, LEVEL_TOP
 
   compileExpression: (o) ->
     {then: thn, else: els or Literal \void} = this
-    @void and thn.void = els.void = true
+
+    if @void
+      @then.void = @else.void = true
+
     if not @else and (@cond or @void)
-      return Parens Binary \&& @if, thn .compile o
-    code = @if.compile o, LEVEL_COND
-    pad  =
-      if not @compact and els.isComplex!
-        \\n + o.indent += TAB
-      else
-        ' '
-    code += "#pad? #{ thn.compile o, LEVEL_LIST }
-             #pad: #{ els.compile o, LEVEL_LIST }"
-    if o.level < LEVEL_COND then code else "(#code)"
+      # optimize `if a then b` => `a && b`
+      Binary \&& @if, thn .compile o
+    else
+      $.ConditionalExpression do
+        test:       @if.compile o, LEVEL_PAREN
+        consequent: @then.compile o, LEVEL_TOP
+
+        # alternate is _required_ for ternary expressions, so
+        # use `void` if not specified
+        alternate:  (@else or Literal \void).compile o, LEVEL_TOP
 
   # Unfolds a node's child if soak,
   # then tuck the node under the created **If**.
@@ -2775,15 +3413,31 @@ class exports.Label extends Node
 
   compileNode: (o) ->
     {label, it} = this
+
     labels = o.labels = [...o.labels or []]
+
     @carp "duplicate label \"#label\"" if label in labels
+
     labels.push label
-    it.isStatement! or it = Block it
-    "#label: " + if it instanceof Block
-      then o.indent += TAB; @compileBlock o, it
-      else it.compile o
+
+    $.LabeledStatement do
+      label: $.Identifier label
+      body:
+        if it.isStatement!
+          it.compile o
+        else
+          $.ExpressionStatement expression: it.compile o
 
 #### Cascade
+# `prog1` is 'with' when used with with:
+#
+# with @input
+#   @output
+#
+# otherwise, `prog1` is `cascade`:
+#
+# @input
+#   @output
 class exports.Cascade extends Node
   (@input, @output, @prog1) ~>
 
@@ -2802,22 +3456,33 @@ class exports.Cascade extends Node
 
   compileNode: ({level}:o) ->
     {input, output, prog1, ref} = this
+
     if prog1 and (\ret of this or level and not @void)
       output.add (Literal(\..) <<< {+cascadee})
+
     if \ret of this
       output.=makeReturn @ret
+
     if ref
     then prog1 or output = Assign Var(ref), output
     else ref = o.scope.temporary \x
+
     if input instanceof Cascade
     then input <<< {ref}
     else input &&= Assign Var(ref), input
+
     o.level &&= LEVEL_PAREN
+
     code = input.compile o
+
     out  = Block output .compile o <<< ref: new String ref
+
     @carp "unreferred cascadee" if prog1 is \cascade and not o.ref.erred
+
     return "#code#{input.terminator}\n#out" unless level
+
     code += ", #out"
+
     if level > LEVEL_PAREN then "(#code)" else code
 
 #### JS
@@ -2848,6 +3513,7 @@ class exports.Require extends Node
     get-file-name = (val) ->
       strip-string val .split '/' .[*-1].split '.' .0
         .replace /-[a-z]/ig, -> it.char-at 1 .to-upper-case!
+
     get-value = (item) ~>
       | item instanceof Key     => item.name
       | item instanceof Var     => item.value
@@ -2858,6 +3524,7 @@ class exports.Require extends Node
           chain := item.tails
         get-value item.head
       | otherwise               => item
+
     process-item = (item) ->
       chain := null
       [asg, value] = switch
@@ -2877,9 +3544,9 @@ class exports.Require extends Node
       Assign (Var asg), (if chain then Chain main, chain else main) .compile o
 
     if @body.items?
-      [process-item item for item in @body.items].join ";\n#{o.indent}"
+      Block [process-item item for item in @body.items] .compile o
     else
-      process-item @body
+      process-item @body .compile o
 
 #### Util
 # A wrapper node for utility functions.
@@ -2890,7 +3557,8 @@ class exports.Util extends Node
 
   isCallable: YES
 
-  compile: -> util @verb
+  compile: (o) ->
+    Var util @verb .compile o
 
   ##### Util.Extends
   # An operator that sets up class-ical inheritance between two constructors,
@@ -2911,6 +3579,9 @@ class exports.Vars extends Node
       v.carp 'invalid variable declaration' unless v instanceof Var
       v.carp "redeclaration of \"#value\"" if o.scope.check value
       o.scope.declare value, v
+
+    # emit EmptyStatement essentially, as variable declaration
+    # is hoisted into the o.scope
     Literal \void .compile o, level
 
 #### Parser Utils
@@ -2965,6 +3636,15 @@ Scope ::=
   READ_ONLY: const:\constant function:\function undefined:\undeclared
 
   # Adds a new variable or overrides an existing one.
+  # `type` is either a string or an object
+  # with the field {value} (from the `assign` method)
+  # The {value} fields are for variables that are
+  # initialized in the VariableDeclarator, and the value must
+  # be a valid LiveScript AST node.
+  #
+  # variables of type 'function' are only added to
+  # be able to check existence within a scope. They are not
+  # emitted in the VariableDeclaration at the top of the scope.
   add: (name, type, node) ->
     if node and t = @variables"#name."
       if @READ_ONLY[t] or @READ_ONLY[type]
