@@ -4,6 +4,8 @@
 # To convert the syntax tree into a string of JavaScript code,
 # call `Block::compileRoot`.
 
+$ = require \./js
+
 ### Node
 # The abstract base class for all nodes in the syntax tree.
 # Each subclass implements the `compileNode` method, which performs the
@@ -350,38 +352,52 @@ class exports.Literal extends Atom
 
   compile: (o, level ? o.level) ->
     switch val = "#{@value}"
-    | \this      => o.scope.fun?bound or val
+    | \this      =>
+      if o.scope.fun?bound
+        $.Identifier name: that
+      else
+        $.ThisExpression!
     | \void      =>
       if level is LEVEL_TOP
-        ''
+        $.EmptyStatement!
       else if level is LEVEL_CALL
         @carp 'invalid use of ' + @value
       else
-        'void 8'
+        # void 8
+        $.UnaryExpression operator: void, argument: $.Literal value: 8
     | \null      =>
       if level is LEVEL_CALL
         @carp 'invalid use of ' + @value
       else
-        'null'
-    | \on \yes   => 'true'
-    | \off \no   => 'false'
+        $.Literal value: null
+    | \on \yes   =>
+        $.Literal value: true
+    | \off \no   =>
+        $.Literal value: false
     | \*         => @carp 'stray star'
     | \..        =>
       @carp 'stray reference' unless o.ref
       if not @cascadee then o.ref.erred = true
-      o.ref
+      $.Identifier name: o.ref
     | \debugger  =>
-      if level
-        "(function(){\n#TAB#{o.indent}debugger;\n#{o.indent}}())"
+      if level > LEVEL_TOP
+        # wrap debugger statement in IEFE
+        $.FunctionExpression params: [], body:
+          $.BlockStatement body: $.DebuggerStatement!
       else
-        \debugger
+        $.DebuggerStatement!
     | otherwise =>
-      unless @abused
+      if @abused
+        val
+      else
         try
-          eval val
+          # JS AST requires actual strings, numbers, regexes etc
+          # so we must eval our string sources. We could do more
+          # strict vivification, but given that we're in a JS execution
+          # environment anyway, might as well defer to it for parsing.
+          $.Literal value: eval val
         catch
-          console.error "couldn't eval #val"
-      val
+          throw new Error "couldn't eval literal #val : #e"
 
 #### Var
 # Variables.
@@ -398,7 +414,11 @@ class exports.Var extends Atom
 
   varName: ::show
 
-  compile: (o) -> if @temp then o.scope.free @value else @value
+  compile: (o) ->
+    if @temp
+      o.scope.free @value
+
+    $.Identifier name: @value
 
 #### Key
 # A property name in the form of `{key: _}` or `_.key`.
@@ -413,7 +433,14 @@ class exports.Key extends Node
     {name} = this
     if @reserved or name in <[ arguments eval ]> then "$#name" else name
 
-  compile: ::show = -> if @reserved then "'#{@name}'" else @name
+  show: -> if @reserved then "'#{@name}'" else @name
+
+  compile: ->
+    if @reserved
+      # need to compile as a literal string for ES3 compliance
+      $.Literal "#{@name}"
+    else
+      $.Identifier {@name}
 
 #### Index
 # Dots and brackets to access an object's property.
@@ -440,9 +467,19 @@ class exports.Index extends Node
   varName: -> @key instanceof [Key, Literal] and @key.varName!
 
   compile: (o) ->
-    code = @key.compile o, LEVEL_PAREN
-    if @key instanceof Key and \' is not code.charAt 0
-    then ".#code" else "[#code]"
+    # Chain compilation handles all of the fancy work with @vivify and @assign
+    # and @soak, so if we're actually getting compiled, we are just a simple
+    # MemberExpression at this point
+
+    js-key = @key.compile o, LEVEL_PAREN
+
+    $.MemberExpression do
+      # object is set by Chain::compile
+      property: js-key
+
+      # identifiers   => a.b
+      # anything else => a[b]
+      computed: not js instanceof $.Identifier
 
 #### Slice
 # slices away at the target
@@ -610,9 +647,11 @@ class exports.Chain extends Node
       [partial, ...post] = rest if rest?
       @tails = pre
       context = if pre.length then Chain head, pre[til -1] else Literal \this
+
       return (Chain (Chain Var util \partialize
         .add Index Key \apply
         .add Call [context, Arr [this; Arr partial.args; Arr partial.partialized]]), post).compile o
+
     @carp 'invalid callee' if tails.0 instanceof Call and not head.isCallable!
 
     @expandSlice o; @expandBind o; @expandSplat o; @expandStar o
@@ -627,13 +666,30 @@ class exports.Chain extends Node
         #{idt}return (t = typeof result)  == "object" || t == "function" ? result || child : child;
         #{TAB}})(#{ func.compile o}, #{@splatted-new-args.compile o, LEVEL_CALL}, function(){})
       """
-    return @head.compile o unless @tails.length
-    base = @head.compile o, LEVEL_CALL; news = rest = ''
-    for t in @tails
-      news += 'new ' if t.new
-      rest += t.compile o
-    base += ' ' if \. is rest.charAt 0 and SIMPLENUM.test base
-    news + base + rest
+
+    # compile our flattened Chain node into nested JS AST expression nodes
+    # we keep mutating the `js` variable to wrap the previous node
+    # in the next Call/Member Expression,
+    js = @head.compile o
+
+    for node in @tails
+      js-node = node.compile o
+      if js-node instanceof $.MemberExpression
+        js-node.object = js
+      else # call expression
+        js-node.callee =
+          # XXX compile Call.member = '.apply'/'.call' abuse as
+          # separate CallExpression
+          if node.member?
+            $.MemberExpression do
+              object: js
+              property: $.Identifier name: that.substring 1
+          else
+            js
+
+      js = js-node
+
+    return js
 
   # Unfolds a soak into an __If__: `a?.b` => `a.b if a?`
   unfoldSoak: (o) ->
@@ -793,6 +849,13 @@ class exports.Chain extends Node
 
 #### Call
 # `x(y)`
+#
+# Note that `new a()` is also parsed as a Chain Call with @new set to 'new',
+# while `new a` is parsed as a Unary with the `new` operator.
+#
+# In JS, there is only NewExpression, so this node as well as the
+# Unary LiveScript node compile to it.
+#
 class exports.Call extends Node
   (args || []) ~>
     if args.length is 1 and (splat = args.0) instanceof Splat
@@ -813,9 +876,17 @@ class exports.Call extends Node
   show: -> [@new] + [@method] + [\? if @soak]
 
   compile: (o) ->
-    code  =  (@method or '') + \( + (if @pipe then "\n#{o.indent}" else '')
-    for a, i in @args then code += (if i then ', ' else '') + a.compile o, LEVEL_LIST
-    code + \)
+    # in Chain compilation, it just so happens that NewExpression and
+    # CallExpression compilation work out to the same JS AST "shape",
+    # so no special logic is needed outside of the JS node type.
+
+    # XXX the @method field is an abuse to make AST transformations easier,
+    # so we leave it up to Chain::compile to handle that properly by wrapping
+    # another MemberExpression in the JS AST.
+    if @new
+      $.NewExpression arguments: @args
+    else
+      $.CallExpression arguments: @args
 
   # helper method to make Call chain from other nodes
   @make = (callee, args, opts) ->
@@ -920,8 +991,6 @@ class exports.Obj extends List
   compileNode: (o) ->
     {items} = this
 
-    return (if @front then '({})' else '{}') unless items.length > 0
-
     to-compile = []
     for node, i in items
       # if node.comment
@@ -940,11 +1009,10 @@ class exports.Obj extends List
       Import(Obj(to-compile) <<< {front: @front}, Obj(rest), false, true)
         .compile o <<< indent: @tab
     else
-      code = ''
-      idt = \\n + o.indent += TAB
       dic = {}
 
-      for node in to-compile
+      # convert to js properties and check for duplicates
+      $.ObjectExpression properties: for node in to-compile
         node.=first if logic = node.getDefault!
 
         if logic
@@ -958,26 +1026,30 @@ class exports.Obj extends List
           then node.val = Obj [Prop (Key \__placeholder__), Literal true]
           else if node.val instanceof [Obj, Arr] then node.val.deepEq = true
 
-        if multi then code += \, else multi = true
-
-        code += idt + if node instanceof Prop
-          {key, val} = node
-          if node.accessor
-            node.compileAccessor o, key.=compile o
-          else
-            val.ripName key
-            "#{ key.=compile o }: #{ val.compile o, LEVEL_LIST }"
+        if node instanceof Prop
+          # copy identifier name to otherwise anonymous Function/Class values
+          unless node.accessor
+            node.val.ripName node.key
+        else if node instanceof Key
+          # it's a Key masquerading as an Identifier, need to expand
+          # {a} => {a: a}
+          node = Prop node, Identifier node.name
         else
-          "#{ key = node.compile o }: #key"
+          # it's a Literal, expand
+          # {1} => {1: 1}
+          node = Prop node, node
 
-        # Canonicalize the key, e.g.: `0.0` => `0`
-        ID.test key or key = do Function "return #key"
+        # Canonicalize the key, e.g.: `0.0` => `0` for duplicate checking
+        canon-key =
+          if ID.test node.key
+            do Function "return #{node.key}"
+          else
+            node.key
 
-        node.carp "duplicate property \"#key\"" unless dic"#key." .^.= 1
-
-      code = "{#{ code and code + \\n + @tab }}"
-
-      if @front and \{ is code.charAt! then "(#code)" else code
+        if dic"#canon-key." .^.= 1 # register existence
+          node.compile o
+        else
+          node.carp "duplicate property \"#key\""
 
 #### Prop
 # `x: y`
@@ -996,15 +1068,11 @@ class exports.Prop extends Node
 
   assigns: -> @val.assigns? it
 
-  compileAccessor: (o, key) ->
-    funs = @val
-    if funs.1 and funs.0.params.length + funs.1.params.length is not 1
-      funs.0.carp 'invalid accessor parameter'
-    do
-      for fun in funs
-        fun.accessor = true
-        "#{fun.x}et #key#{ fun.compile o, LEVEL_LIST .slice 8 }"
-    .join ',\n' + o.indent
+  compile: (o) ->
+    # compile to ObjectExpression's sub-node key/val object type
+    key: @key.compile o
+    val: @val.compile o
+    kind: if @accessor then "#{fun.x}et" else \init
 
   compileDescriptor: (o) ->
     obj = Obj!
