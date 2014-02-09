@@ -4,6 +4,7 @@
 # To convert the syntax tree into a string of JavaScript code,
 # call `Block::compileRoot`.
 
+require! esprima
 $ = require \./js
 
 ### Node
@@ -22,7 +23,7 @@ $ = require \./js
     node = @unfoldSoak o or this
     # If a statement appears within an expression, wrap it in a closure.
     return node.compileClosure o if o.level and node.isStatement!
-    code = (node import tab: o.indent)compileNode o
+    code = node.compileNode o
     if node.temps then for tmp in that then o.scope.free tmp
     code
 
@@ -48,7 +49,14 @@ $ = require \./js
 
   # Compiles a child node as a block statement.
   compileBlock: (o, node) ->
-    if node?compile o, LEVEL_TOP then "{\n#that\n#{@tab}}" else '{}'
+    $.BlockStatement body:
+      if node?
+        if node.isStatement!
+          node.compile o, LEVEL_TOP
+        else
+          $.ExpressionStatement expression: node.compile o, LEVEL_TOP
+      else
+        []
 
   # If the code generation wishes to use the result of a complex expression
   # in multiple places, ensure that the expression is only ever evaluated once,
@@ -249,13 +257,15 @@ class exports.Block extends Node
   unwrap: -> if @lines.length is 1 then @lines.0 else this
 
   # Removes trailing comment nodes.
+  # TODO support comment AST nodes that aren't JS
   chomp: ->
     {lines} = this; i = lines.length
     while lines[--i] then break unless that.comment
     lines.length = i + 1
     this
 
-  # Finds the right position for inserting variable declarations.
+  # Finds the right position for inserting variable declarations, i.e.
+  # after any "use strict" or block comments
   neck: ->
     pos = 0
     for x in @lines
@@ -278,53 +288,93 @@ class exports.Block extends Node
     this
 
   compile: (o, level ? o.level) ->
-    return @compileExpressions o, level if level
-    o.block = this; tab = o.indent
-    codes = for node in @lines
+    if level > LEVEL_TOP
+      @compileExpressions o, level
+    else
+      $.BlockStatement body: @compileBlockBody o, level
+
+  compileBlockBody: (o, level ? o.level) ->
+    o.block = this
+    for node in @lines
       node = node.unfoldSoak o or node
-      continue unless code = (node <<< {+front})compile o, level
-      node.isStatement! or code += node.terminator
-      tab + code
-    codes.join \\n
+      ast = (node <<< {+front})compile o, level
+      if not node.isStatement!
+        $.ExpressionStatement expression: ast
+      else
+        ast
 
   # **Block** is the only node that can serve as the root.
   compileRoot: (options) ->
     o = {level: LEVEL_TOP, scope: @scope = Scope.root = new Scope, ...options}
+
     if saveTo = delete o.saveScope
        o.scope = saveTo.savedScope or= o.scope # use savedScope as your scope
+
     delete o.filename
-    o.indent = if bare = delete o.bare then '' else TAB
-    if /^\s*(?:[/#]|javascript:)/test @lines.0?code
-      prefix = @lines.shift!code + \\n
+
+    # TODO I think this is a hack to compile stuff in querystrings
+    # or bookmarklets, disabling for now
+    # if /^\s*(?:[/#]|javascript:)/test @lines.0?code
+    #  prefix = @lines.shift!code + \\n
+
     if delete o.eval and @chomp!lines.length
       if bare then @lines.push Parens @lines.pop! else @makeReturn!
-    code = @compileWithDeclarations o
-    # Wrap everything in a safety closure unless requested not to.
-    bare or code = "(function(){\n#code\n}).call(this);\n"
-    [prefix] + code
 
-  # Compile to a function body.
+    body = @compileWithDeclarations o
+
+    # Wrap everything in a safety closure unless requested not to.
+    unless bare
+      # (function() { ... }).call(this)
+      body = [
+        $.ExpressionStatement expression: $.CallExpression do
+          callee: $.MemberExpression do
+            computed: false
+            object: $.FunctionExpression params: [], body: body
+            property: $.Identifier name: \call
+          arguments: $.ThisExpression!
+      ]
+
+    $.Program {body}
+
+  # Compile to an array of JS Statements, including VariableDeclarations
+  # and FunctionStatements for this scope
   compileWithDeclarations: (o) ->
     o.level = LEVEL_TOP
-    pre = ''
-    if i = @neck!
+    pre = []
+    if (i = @neck!) is not 0
+      # temporarily remove the rest of the lines of this Block,
+      # compile the initial lines, then replace our state with the rest
       rest   = @lines.splice i, 9e9
-      pre    = @compile o
+      pre    = @compileBlockBody o
       @lines = rest
-    return pre unless post = @compile o
-    (pre and "#pre\n") + if @scope then that.emit post, o.indent else post
 
-  # Compile to a comma-separated list of expressions.
+    post = @compileBlockBody o
+
+    if @scope?
+      # prepend and append vars and functions respectively
+      post = @scope.add-scope post
+
+    return pre ++ post
+
+  # Compile to a SequenceExpression i.e. comma-separated list of expressions.
+  # Blocks with only one expression compile to the expression itself for
+  # simplification.
   compileExpressions: (o, level) ->
     {lines} = @chomp!; i = -1
+    # remove starting comments
     while lines[++i] then lines.splice i-- 1 if that.comment
+
     lines.push Literal \void unless lines.length
+
     lines.0 <<< {@front}; lines[*-1] <<< {@void}
-    return lines.0.compile o, level unless lines.1
-    code = ''; last = lines.pop!
-    for node in lines then code += (node <<< {+void})compile(o, LEVEL_PAREN) + ', '
-    code += last.compile o, LEVEL_PAREN
-    if level < LEVEL_LIST then code else "(#code)"
+
+    if lines.length is 1
+      # level is > LEVEL_TOP, so this shouldn't result in a Statement
+      return lines.0.compile o, level
+    else
+      expr = for node in lines
+        (node <<< {+void})compile o, LEVEL_PAREN
+      $.SequenceExpression expressions: expr
 
 #### Atom
 # An abstract node for simple values.
@@ -664,16 +714,11 @@ class exports.Chain extends Node
     @expandSlice o; @expandBind o; @expandSplat o; @expandStar o
 
     if @splatted-new-args
-      # TODO
-      idt = o.indent + TAB
-      func = Chain @head, tails.slice 0 -1
-      return """
-        (function(func, args, ctor) {
-        #{idt}ctor.prototype = func.prototype;
-        #{idt}var child = new ctor, result = func.apply(child, args), t;
-        #{idt}return (t = typeof result)  == "object" || t == "function" ? result || child : child;
-        #{TAB}})(#{ func.compile o}, #{@splatted-new-args.compile o, LEVEL_CALL}, function(){})
-      """
+      # compile call to splat-new utility function which applies
+      # arguments to a newly constructed `clazz`
+      clazz = Chain @head, tails.slice 0 -1
+      return (Chain Var util \splat-new
+        .add Call [clazz, @splatted-new-args]).compile o
 
     # compile our flattened Chain node into nested JS AST expression nodes
     # we keep mutating the `js` variable to wrap the previous node
@@ -1007,12 +1052,12 @@ class exports.Obj extends List
       # compile import, making sure to force an import statement
       # rather than gluing both objects back together
       Import(Obj(to-compile) <<< {front: @front}, Obj(rest), false, true)
-        .compile o <<< indent: @tab
+        .compile o
     else
       dic = {}
 
       # convert to js properties and check for duplicates
-      $.ObjectExpression properties: for node in to-compile
+      properties = for node in to-compile
         node.=first if logic = node.getDefault!
 
         if logic
@@ -1050,6 +1095,7 @@ class exports.Obj extends List
           node.compile o
         else
           node.carp "duplicate property \"#key\""
+      $.ObjectExpression {properties}
 
 #### Prop
 # `x: y`
@@ -1109,7 +1155,7 @@ class exports.Arr extends List
     if Splat.hasSplats items
       Splat.expandArray(items, false)compile o
     else
-      $.ArrayExpression elements: for item in items
+      $.ArrayExpression {elements: for item in items
         if @deepEq
           if item instanceof Var and target.value is \_
             item = Obj [Prop (Key \__placeholder__), Literal true]
@@ -1117,7 +1163,7 @@ class exports.Arr extends List
             item.deepEq = true
 
         item.compile o
-
+      }
   @maybe = (nodes) ->
     return nodes.0 if nodes.length is 1 and nodes.0 not instanceof Splat
     constructor nodes
@@ -1681,7 +1727,7 @@ class exports.Assign extends Node
         Assign left, Var(o.scope.free res)
       ] .compile o
     else
-      $.AssignmentExpression
+      $.AssignmentExpression do
         operator: sign
         left: left.compile o
         right: right.compile o, LEVEL_LIST
@@ -1923,10 +1969,6 @@ class exports.Import extends Node
       [left, reft, @temps] = @left.cache o
       reft = Var reft
 
-    [delim, space] = if top then [\; \\n + @tab] else [\, ' ']
-    delim += space
-
-    body = []
     if @temps
       body.push left
 
@@ -2142,7 +2184,6 @@ class exports.Fun extends Node
     # import this object into the actual node
     js-fn = {}
 
-    code = \function
     if @bound is \this$
       if @ctor
         # var this$ = this instanceof ctor$ ? this : new ctor$
@@ -2193,7 +2234,7 @@ class exports.Fun extends Node
       # initialize function in VariableDeclarator
       # and use the temp variable in its place
       # force expression for non-currying cases, since it's in assignment
-      return pscope.assign pscope.temporary(\fn), curry-code-check(true)
+      return pscope.assign-js pscope.temporary(\fn), curry-code-check(true)
 
     if @returns
       # we're in a statement context so wrap in $.BlockStatement so
@@ -2989,7 +3030,7 @@ class exports.For extends While
               operator: '>' + op-add
               left: $.Identifier name: idx
               right: to-var.compile o
-            test: $.BinaryExpresion do
+            alternate: $.BinaryExpresion do
               operator: '<' + op-add,
               left: $.Identifier name: idx
               right: to-var.compile o
@@ -3471,20 +3512,20 @@ class exports.Cascade extends Node
     then input <<< {ref}
     else input &&= Assign Var(ref), input
 
-    o.level &&= LEVEL_PAREN
+    if o.level is LEVEL_TOP
+      o.level = LEVEL_PAREN
 
-    code = input.compile o
-
-    out  = Block output .compile o <<< ref: new String ref
-
+    out = Block output .compile o <<< ref: new String ref
     @carp "unreferred cascadee" if prog1 is \cascade and not o.ref.erred
 
-    return "#code#{input.terminator}\n#out" unless level
-
-    code += ", #out"
-
-    if level > LEVEL_PAREN then "(#code)" else code
-
+    if level is LEVEL_TOP
+      $.BlockStatement body:
+        * input.compile o
+        * out
+    else
+      $.SequenceExpression expressions:
+        * input.compile o
+        * out
 #### JS
 # Embedded JavaScript snippets.
 class exports.JS extends Node
@@ -3498,7 +3539,7 @@ class exports.JS extends Node
 
   compile: ->
     console.error "JS used internally:#{if @comment then '(comment)' else ''} #{@code}"
-    if @literal then entab @code, it.indent else @code
+    @code
 
 #### Require
 class exports.Require extends Node
@@ -3636,13 +3677,20 @@ Scope ::=
   READ_ONLY: const:\constant function:\function undefined:\undeclared
 
   # Adds a new variable or overrides an existing one.
-  # `type` is either a string or an object
-  # with the field {value} (from the `assign` method)
-  # The {value} fields are for variables that are
-  # initialized in the VariableDeclarator, and the value must
+  # `type` is either a string enum of "const" or "var" or "reuse", or
+  # "arg" or "function",  or an object with the field `value` (from the
+  # `assign` method).
+  #
+  # The `value` fields are for variables that are
+  # initialized in the VariableDeclarator, and the value SHOULD
   # be a valid LiveScript AST node.
   #
-  # variables of type 'function' are only added to
+  # XXX as a hack for curry-code-check and utility functions,
+  # `type.value` may also be a JS AST node, in which case `type.is-js` MUST
+  # be true.
+  # This is respected by the Scope#assign-js and Scope#require-util methods.
+  #
+  # variables of type 'function' or "arg" are only added to
   # be able to check existence within a scope. They are not
   # emitted in the VariableDeclaration at the top of the scope.
   add: (name, type, node) ->
@@ -3672,6 +3720,14 @@ Scope ::=
   # Ensures that an assignment is made at the top of this scope.
   assign: (name, value) -> @add name, {value}
 
+  # Ensures a util function or helper assignment is declared as a statement at
+  # the bottom of this scope, e.g. var slice$ = [].slice.
+  require-util: (name, value) -> @add name, {value, +is-js}
+
+  # Ensures that an assignment is made at the top of this scope for
+  # already compiled JS AST.
+  assign-js: (name, js-value) -> @add name, {value, +is-js}
+
   # If we need to store an intermediate result, find an available name for a
   # compiler-generated variable. `var$`, `var1$`, and so on.
   temporary: (name || \ref) ->
@@ -3696,19 +3752,31 @@ Scope ::=
     @variables"#name." ||= \upvar
     ''
 
-  # Concatenates the declarations in this scope.
-  emit: (code, tab) ->
+  # Concatenates the declarations into this scope.
+  # returns a new array of statements.
+  add-scope: (js-statements) ->
     vrs = []; asn = []; fun = []
     for name, type of @variables
       name.=slice 0 -1
       if type in <[ var const reuse ]>
-        vrs.push name
+        vrs.push $.VariableDeclarator do
+          id: $.Identifier {name}
+          init: null
       else if type.value
-        if ~(val = entab that, tab)lastIndexOf \function( 0
-        then fun.push "function #name#{ val.slice 8 }"
-        else asn.push "#name = #val"
-    code = "#{tab}var #that;\n#code" if vrs.concat asn .join ', '
-    if fun.join "\n#tab" then "#code\n#tab#that" else code
+        if type.is-js and type.value.type is \FunctionDeclaration
+          fun.push type.value
+        else
+          asn.push $.VariableDeclarator do
+            id: $.Identifier {name}
+            init:
+              if type.is-js
+                type.value
+              else
+                type.value.compile o, LEVEL_PAREN
+
+    decl = $.VariableDeclaration declarations: vrs ++ asn
+
+    return [decl] ++ js-statements ++ fun
 
 ##### Constants
 
@@ -3717,7 +3785,22 @@ function NO   then false
 function THIS then this
 function VOID then void
 
-UTILS =
+unwrap-ast = (program-node) ->
+  if program-node.body.0.type is \FunctionDeclaration
+    program-node.body.0
+  else
+    # the only other util type is an expression like `[].slice`
+    program-node.body.0.expression
+
+# parse helper utils to JS AST on-demand
+lazy-parse = (util-defs) ->
+  with {}
+    for let name, js of util-defs
+      var ast
+      ..[name] = ->
+        ast ?:= unwrap-ast esprima.parse(js)
+
+UTILS = lazy-parse do
   # Creates an object's prototypal child, ensuring `__proto__`.
   clone: '''function(it){
     function fun(){} fun.prototype = it;
@@ -3883,6 +3966,17 @@ UTILS =
     }
   }'''
 
+  # apply arguments to a constructor call, which can't
+  # be done simply.
+  splat-new: '''function(clazz, args) {
+    var ctor = function(){}, result, child, t;
+    ctor.prototype = clazz.prototype;
+    child = new ctor; result = clazz.apply(child, args);
+    return (t = typeof result)  == "object" || t == "function"
+           ? result || child 
+           : child;
+  }'''
+
   # Shortcuts to speed up the lookup time for native methods.
   split    : "''.split"
   replace  : "''.replace"
@@ -3919,9 +4013,7 @@ SIMPLENUM = /^\d+$/
 ##### Helpers
 
 # Declares a utility function at the top level.
-function util then Scope.root.assign it+\$ UTILS[it]
-
-function entab code, tab then code.replace /\n/g \\n + tab
+function util then Scope.root.require-util it+\$ UTILS[it]!
 
 function fold f, memo, xs
   for x in xs then memo = f memo, x
