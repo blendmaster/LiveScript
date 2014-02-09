@@ -48,6 +48,7 @@ const NODES =
   VariableDeclarator    : Node
 
   ThisExpression        : Expression
+  AssignmentExpression  : Expression
   ArrayExpression       : Expression
   ObjectExpression      : Expression
   FunctionExpression    : Expression
@@ -71,6 +72,7 @@ for let node, zuper of NODES
   exports[node] = class extends zuper
     # instead of tuple constructors, take an object for readability
     # e.g. Program(body: [...])
-    (fields) ~> import fields
+    (fields) ~>
+      @type = node
+      import fields
     @displayName = node
-    type: node
