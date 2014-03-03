@@ -75,4 +75,18 @@ for let node, zuper of NODES
     (fields) ~>
       @type = node
       import fields
+      if node.body
+        for node.body
+          unless .. instanceof Statement
+            throw new Error this
+      if node is \SwitchCase
+        unless @consequent
+          throw new Error this
+      if node is \MemberExpression
+        unless @property instanceof Expression
+          throw new Error this
+        if @property.type is \Identifier
+          if @property.name is ''
+            throw new Error this
+
     @displayName = node

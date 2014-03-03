@@ -22,7 +22,7 @@ $ = require \./js
     o.level? = level
     node = @unfoldSoak o or this
     # If a statement appears within an expression, wrap it in a closure.
-    return node.compileClosure o if o.level and node.isStatement!
+    return node.compileClosure o if o.level > LEVEL_TOP and node.isStatement!
     code = node.compileNode o
     if node.temps then for tmp in that then o.scope.free tmp
     code
@@ -212,7 +212,19 @@ exports.parse    = (json) -> exports.fromJSON JSON.parse json
 exports.fromJSON = function
   return it unless it and typeof it is \object
   if it.type
-    node = ^^exports[that]::
+    # XXX the Switch statement has its own `type` field which
+    # clobbers the constructor type, so fix
+    if it.type is \switch or it.type is \match
+      node = ^^exports.Switch::
+    # XXX the Slice expression sometimes has type = 'to' or 'til'
+    else if it.type is \to or it.type is \til
+      node = ^^exports.Slice::
+    else
+      try
+        node = ^^exports[it.type]::
+      catch
+        throw new Error("can't find #{JSON.stringify it}")
+
     for key, val of it then node[key] = fromJSON val
     return node
   if it.length? then [fromJSON v for v in it] else it
@@ -429,16 +441,12 @@ class exports.Literal extends Atom
       $.Identifier name: \arguments
     | \void      =>
       if level is LEVEL_TOP
+        throw new Error this
         $.EmptyStatement!
-      else if level is LEVEL_CALL
-        @carp 'invalid use of ' + @value
       else
         # void 8
-        $.UnaryExpression operator: void, argument: $.Literal value: 8
+        $.UnaryExpression operator: \void, argument: $.Literal value: 8
     | \null      =>
-      if level is LEVEL_CALL
-        @carp 'invalid use of ' + @value
-      else
         $.Literal value: null
     | \on \yes   =>
         $.Literal value: true
@@ -459,10 +467,9 @@ class exports.Literal extends Atom
     | otherwise =>
       # XXX @let replacement for `for let` loops
       if @abused-by-let
-        return @let-abuse # already compiled
-
-      if @abused
-        val
+        @let-abuse # already compiled
+      else if @abused-by-star
+        @value # already compiled
       else
         try
           # JS AST requires actual strings, numbers, regexes etc
@@ -759,6 +766,8 @@ class exports.Chain extends Node
       js-node = node.compile o
       if js-node instanceof $.MemberExpression
         js-node.object = js
+      else if js-node instanceof $.NewExpression
+        js-node.callee = js
       else # call expression
         js-node.callee =
           # XXX compile Call.method = '.apply'/'.call' abuse as
@@ -903,7 +912,7 @@ class exports.Chain extends Node
       # currently nice ast traversal facilities that allow replacement
       # of nodes, so we'll keep the abuse for now.
       value = Chain(ref, [Index Key \length])compile o
-      for star in stars then star <<< {value, isAssignable: YES, +abused}
+      for star in stars then star <<< {value, isAssignable: YES, +abused-by-star}
 
       # replace our head with the assignment and the this Index,
       # which is now at the first position due to the splice
@@ -967,9 +976,9 @@ class exports.Call extends Node
     # so we leave it up to Chain::compile to handle that properly by wrapping
     # another MemberExpression in the JS AST.
     if @new
-      $.NewExpression arguments: [arg.compile o for arg in @args]
+      $.NewExpression arguments: [arg.compile o, LEVEL_CALL for arg in @args]
     else
-      $.CallExpression arguments: [arg.compile o for arg in @args]
+      $.CallExpression arguments: [arg.compile o, LEVEL_CALL for arg in @args]
 
   # helper method to make Call chain from other nodes
   @make = (callee, args, opts) ->
@@ -1076,7 +1085,8 @@ class exports.Obj extends List
       dic = {}
 
       # convert to js properties and check for duplicates
-      properties = for node in to-compile
+      properties = []
+      for node in to-compile
         node.=first if logic = node.getDefault!
 
         if logic
@@ -1111,13 +1121,17 @@ class exports.Obj extends List
             node.key
 
         if dic"#canon-key." .^.= 1 # register existence
-          node.compile o
+          # XXX Props with getters and setters can potentially compile
+          # to two Property JS AST nodes
+          properties.push ...node.compileAccessors o
         else
           node.carp "duplicate property \"#key\""
       $.ObjectExpression {properties}
 
 #### Prop
 # `x: y`
+# If this is a simple prop, @val is an AST node
+# If this is a getter and or setter, @val is an array of Fun AST nodes.
 class exports.Prop extends Node
   (@key, @val) ~>
     return Splat @val if key.value is \...
@@ -1133,12 +1147,24 @@ class exports.Prop extends Node
 
   assigns: -> @val.assigns? it
 
-  compile: (o) ->
-    # compile to ObjectExpression's sub-node key/val object type
-    type: \Property
-    key: @key.compile o
-    value: @val.compile o
-    kind: if @accessor then "#{fun.x}et" else \init
+  # livescript Prop AST can compile to two JS Properties if
+  # there is a getter and a setter, so we return an array
+  compileAccessors: (o) ->
+    if @accessor
+      for fun in @val
+        fun.accessor = true
+
+        type: \Property
+        key: @key.compile o
+        value: fun.compile o, LEVEL_LIST
+        kind: "#{fun.x}et" # get or set
+    else
+      [
+        type: \Property
+        key: @key.compile o
+        value: @val.compile o
+        kind: \init
+      ]
 
   compileDescriptor: (o) ->
     with Obj!
@@ -1173,16 +1199,16 @@ class exports.Arr extends List
     {items} = this
     # if there are splats to expand out
     if Splat.hasSplats items
-      Splat.expandArray(items, false)compile o
+      Splat.expandArray(items, false)compile o, LEVEL_LIST
     else
       $.ArrayExpression {elements: for item in items
         if @deepEq
-          if item instanceof Var and target.value is \_
+          if item instanceof Var and item.value is \_
             item = Obj [Prop (Key \__placeholder__), Literal true]
           else if item instanceof [Obj, Arr]
             item.deepEq = true
 
-        item.compile o
+        item.compile o, LEVEL_LIST
       }
   @maybe = (nodes) ->
     return nodes.0 if nodes.length is 1 and nodes.0 not instanceof Splat
@@ -1274,9 +1300,14 @@ class exports.Unary extends Node
       if it instanceof Var and o.scope.checkReadOnly it.value
         @carp "#{ crement op } of #that \"#{it.value}\"" ReferenceError
       it{front} = this if @post
+
+      return $.UpdateExpression do
+        operator: op
+        argument: it.compile o, LEVEL_OP + PREC.unary
+        prefix: not @post
     case \^^
       return
-        Call.make $.Identifier(name: util(\clone)), [it]
+        Call.make Var(util(\clone)), [it]
           .compile o, LEVEL_LIST
     case \jsdelete
       return $.UnaryExpression operator: \delete, argument: it.compile o
@@ -1286,11 +1317,13 @@ class exports.Unary extends Node
         .add Index Key \call
         .add Call [it]
         .add Index Key \slice
-        .add Call [Literal 8, Literal -1]
+        .add Call [Literal 8; Unary \- Literal 1]
+        .compile o
 
     return $.UnaryExpression do
       operator: op
       argument: it.compile o, LEVEL_OP + PREC.unary
+      prefix: not @post
 
   # `^delete o[p, ...q]` => `[^delete o[p], ...^delete o[q]]`
   compileSpread: (o) ->
@@ -1444,6 +1477,7 @@ class exports.Binary extends Node
     $.BinaryExpression do
       operator: \&&
       left: $.BinaryExpression do
+        operator: @op
         left: @first.compile o, level
         right: sub.compile o, level
       right:
@@ -1521,7 +1555,7 @@ class exports.Binary extends Node
 
     # `'x' * 2` => `'xx'`
     else if x instanceof Literal
-      Literal value: (q = (x.=compile o)charAt!) + "#{ x.slice 1 -1 }" * n + q
+      Literal "#{x.compile(o)value}" * n
 
     # `"#{x}" * 2` => `(ref$ = "" + x) + ref$`
     else
@@ -1530,11 +1564,11 @@ class exports.Binary extends Node
       else
         [sub, ref] = x.cache o, true # once
 
-        ident = $.Identifier name: ref
+        ident = ref.compile o
 
         js = sub.compile o
         # add ref n - 1 times by wrapping + BinaryExpressions
-        for i to n-1
+        for i til n-1
           js = $.BinaryExpression do
             operator: \+
             left: js
@@ -1804,15 +1838,16 @@ class exports.Assign extends Node
         rite  = Var rref
 
     # rendArr or rendObj
-    list = @"rend#{ left.constructor.displayName }" o, items, rite
+    list = for @"rend#{ left.constructor.displayName }" o, items, rite
+      ..compile o, LEVEL_LIST
 
     o.scope.free rref  if rref
-    list.unshift cache if cache
+    list.unshift cache.compile o, LEVEL_LIST if cache
 
     if ret or not list.length
       list.push rite.compile o, r-compile-level
 
-    $.SequenceExpression expressions: [..compile o, LEVEL_LIST for list]
+    $.SequenceExpression expressions: list
 
   compileSplice: (o) ->
     [from-exp-node, from-exp] = Chain @left.from .cacheReference o
@@ -1990,7 +2025,6 @@ class exports.Import extends Node
       reft = Parens reft if reft.isComplex!
     else
       [left, reft, @temps] = @left.cache o
-      reft = Var reft
 
     body = []
 
@@ -2009,29 +2043,35 @@ class exports.Import extends Node
 
       node.=first if logic
 
-      if dyna = node instanceof Parens
-        [key, val] = node.it.cache o, true
-      else if node instanceof Prop
+      if node instanceof Prop and node.accessor
         {key, val} = node
+
         if node.accessor
           key = Literal "'#{key.name}'" if key instanceof Key
           # Object.defineProperty(reft, key, descriptor)
-          node.push do
-            Chain Identifier \Object
+          body.push do
+            Chain Var \Object
               .add Index Key \defineProperty
               .add Call [
                 reft
                 key
                 node.compileDescriptor o
               ]
-          continue
+      else
+        if dyna = node instanceof Parens
+          [key, val] = node.it.cache o, true
+        else if node instanceof Prop
+          {key, val} = node
+        else
+          key = val = node
 
-      else key = val = node
-      dyna  or  key.=maybeKey!
-      logic and val = logic <<< first: val
+        dyna  or  key.=maybeKey!
+        logic and val = logic <<< first: val
 
-      body.push Assign(Chain reft, [Index key]; val)
-
+        try
+          body.push Assign(Chain reft, [Index key]; val)
+        catch
+          throw new Error "here #e"
 
     # if we're returning, append left reference
     if not @void and not node instanceof Splat
@@ -2054,7 +2094,7 @@ class exports.In extends Node implements Negatable
     if array not instanceof Arr or items.length < 2
       # in$(item, array)
       js = $.CallExpression do
-        callee: $.Identifier util \in
+        callee: $.Identifier name: util \in
         arguments:
           @item.compile o, LEVEL_LIST
           array.compile o, LEVEL_LIST
@@ -2083,36 +2123,46 @@ class exports.In extends Node implements Negatable
       [cmp, cnj] = if @negated then [' !== ' ' && '] else [' === ' ' || ']
 
       to-compile = items.slice!
-      first-test = to-compile.pop!
+      first-test = to-compile.shift!
 
       if @item.isComplex!
         [sub, ref] = @item.cache o, false, LEVEL_PAREN
 
-        item-ref = $.Identifier name: ref
+        item-ref = Var ref
 
         # start node with assignment of ref
         # (ref$ = complex) === 1 || ref$ === 2 ...
         js = $.BinaryExpression do
           operator: cmp
-          left: sub.compile o
-          right: first-test.compile o
+          left: sub
+          right:
+            if first-test instanceof Splat
+              # compile utility function against inside of splat
+              (new In(item-ref; first-test.it) <<< {@negated})compile o
+            else
+              first-test.compile o
       else
         # simple, use actual item
-        item-ref = @item.compile o
+        item-ref = @item
 
         js = $.BinaryExpression do
           operator: cmp
-          left: item-ref
-          right: first-test.compile o
+          left: item-ref.compile o
+          right:
+            if first-test instanceof Splat
+              # compile utility function against inside of splat
+              (new In(item-ref; first-test.it) <<< {@negated})compile o
+            else
+              first-test.compile o
 
       # successively chain other comparisons
-      while (test = to-compile.pop!)
+      while (test = to-compile.shift!)
         js = $.BinaryExpression do
           operator: cnj
           left: js # previous comparison
           right: $.BinaryExpression do
             operator: cmp
-            left: item-ref
+            left: item-ref.compile o
             right:
               if test instanceof Splat
                 # compile utility function against inside of splat
@@ -2136,7 +2186,7 @@ class exports.Existence extends Node implements Negatable
 
     js-node = node.compile o, LEVEL_OP + PREC\==
 
-    if node instanceof Var and not o.scope.check node.name, true
+    if node instanceof Var and not o.scope.check node.value, true
       [op, eq] = if @negated then <[ || = ]> else <[ && ! ]>
 
       # typeof it != 'undefined' && it !== null
@@ -2646,7 +2696,7 @@ class exports.Splat extends Node
 #### Jump
 # `break` `continue`
 class exports.Jump extends Node
-  (@verb, @label) ->
+  (@verb, @label) ~>
 
   show: -> (@verb or '') + if @label then ' ' + that else ''
 
@@ -2679,7 +2729,8 @@ class exports.Throw extends Jump
   getJump: VOID
 
   compileNode: (o) ->
-    $.ThrowStatement argument: @it?compile o, LEVEL_PAREN or \null
+    $.ThrowStatement argument:
+      @it?compile(o, LEVEL_PAREN) || $.Literal value: null
 
 #### YadaYadaYada
 # `...` indicates unimplementedness.
@@ -2843,7 +2894,7 @@ class exports.While extends Node
          @is-comprehension or @in-comprehension
 
         res = Var o.scope.assign \results$ empty
-        lines[*-1]?=makeReturn res
+        lines[*-1]?=makeReturn res.value
 
       ret = $.ReturnStatement argument: (res or empty)compile o
 
@@ -3194,12 +3245,13 @@ class exports.For extends While
           operator: '++'
           argument: $.Identifier name: idx
 
-    if @index? and @index is not ''
-      @body.add Assign (Var @index), Var idx
-
     if @item? and not @item.isEmpty!
-      @body.add Assign @item,
+      @body.prepend Assign @item,
         Chain source-var .add Index(Var(idx)) # source-var[idx]
+
+    if @index? and @index is not ''
+      @body.prepend Assign (Var @index), Var idx
+
 
     # set scope's cascade ref to the temp var if present
     o.ref = @item.value if @ref
@@ -3326,14 +3378,17 @@ class exports.Switch extends Node
     this
 
   compileNode: (o) ->
-    {tab} = this
     [target-node, target] = Chain @target .cacheReference o if @target
 
     topic = if @type is \match
       t = if target then [target-node] else []
       Block (t ++ [Literal \false]) .compile o, LEVEL_PAREN
     else
-      !!@topic and @anaphorize!compile o, LEVEL_PAREN
+      if !!@topic
+        @anaphorize!compile o, LEVEL_PAREN
+      else
+        # topic falsy, so use Literal false to make short cases
+        Literal false
 
     stop  = @default or @cases.length - 1
 
@@ -3343,14 +3398,14 @@ class exports.Switch extends Node
     # flatten compiled cases
     for c, i in @cases
       js-cases.push ...c.compileCase do
-        o, tab, i is stop, (@type is \match or !topic), @type, target
+        o, i is stop, (@type is \match or !topic), @type, target
 
-    if @default
+    if @default and @default.lines.length > 0
       js-cases.push do
         # test: null means `default`, confusingly enough
         $.SwitchCase do
           test: null
-          consequent: @default.compile o, LEVEL_TOP
+          consequent: @default.compileBlockBody o, LEVEL_TOP
 
     $.SwitchStatement do
       discriminant: topic
@@ -3370,7 +3425,7 @@ class exports.Case extends Node
 
   # a single LiveScript Case can compile to multple
   # JS cases, so this returns an array of $.SwitchCase
-  compileCase: (o, tab, nobr, bool, type, target) ->
+  compileCase: (o, nobr, bool, type, target) ->
     tests = []
     for test in @tests
       test.=expandSlice(o)unwrap!
@@ -3394,7 +3449,9 @@ class exports.Case extends Node
 
     [..., last-case] = js-cases =
       for t in tests
-        $.SwitchCase test: t.compile o, LEVEL_PAREN
+        $.SwitchCase do
+          test: t.compile o, LEVEL_PAREN
+          consequent: []
 
     {lines} = @body; last = lines[*-1]
 
@@ -3410,7 +3467,7 @@ class exports.Case extends Node
       @body.add Jump \break
 
     # compile body to last case
-    last-case.consequent = @body.compile o, LEVEL_TOP
+    last-case.consequent = @body.compileBlockBody o, LEVEL_TOP
 
     return js-cases
 
@@ -3451,8 +3508,8 @@ class exports.If extends Node
   compileStatement: (o) ->
     $.IfStatement do
       test:       @if  .compile o, LEVEL_PAREN
-      consequent: @then.compile o, LEVEL_TOP
-      alternate:  @else?compile o, LEVEL_TOP
+      consequent: wrap-statement @then.compile o, LEVEL_TOP
+      alternate:  if @else? then wrap-statement @else.compile o, LEVEL_TOP
 
   compileExpression: (o) ->
     {then: thn, else: els or Literal \void} = this
@@ -3478,6 +3535,13 @@ class exports.If extends Node
     if parent[name]unfoldSoak o
       parent[name] = that.then
       that <<< {parent.cond, parent.void, then: Chain parent}
+
+  function wrap-statement js
+    if js instanceof $.Statement
+      js
+    else
+      $.ExpressionStatement expression: js
+
 
 #### Label
 # A labeled block or statement.
@@ -3791,6 +3855,8 @@ Scope ::=
   # Checks to see if a variable has already been declared.
   # Walks up the scope if `above` flag is specified.
   check: (name, above) ->
+    if not name?
+      throw new Error "checking for var with undefined name!"
     return type if (type = @variables"#name.") or not above
     @parent?check name, above
 
@@ -4042,7 +4108,7 @@ UTILS = lazy-parse do
   # Shortcuts to speed up the lookup time for native methods.
   split    : "''.split"
   replace  : "''.replace"
-  toString : '{}.toString'
+  toString : '({}).toString'
   join     : '[].join'
   slice    : '[].slice'
   splice   : '[].splice'
