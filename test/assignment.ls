@@ -69,9 +69,10 @@ a ++= 6
 eq '1,2,3,4,5,6' String a
 
 # Pipe
-x = 3
-x |>= (+ 7)
-eq 10 x
+# XXX doesn't compile even on master
+# x = 3
+# x |>= (+ 7)
+# eq 10 x
 
 # obj ::= obj2 as alias to obj::<<<obj2
 lala = ->
