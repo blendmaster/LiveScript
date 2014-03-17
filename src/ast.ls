@@ -3536,11 +3536,17 @@ class exports.If extends Node
       that <<< {parent.cond, parent.void, then: Chain parent}
 
   function wrap-statement js
-    if js instanceof $.Statement
+    if js instanceof $.BlockStatement
       js
     else
-      $.ExpressionStatement expression: js
-
+      # add braces to single-expression consequents for parity with
+      # original compilation. Otherwise, escodegen will compile without
+      # braces.
+      $.BlockStatement body:
+        if js instanceof $.Statement
+          js
+        else
+          $.ExpressionStatement expression: js
 
 #### Label
 # A labeled block or statement.
