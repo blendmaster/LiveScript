@@ -3523,7 +3523,15 @@ class exports.If extends Node
     $.IfStatement do
       test:       @if  .compile o, LEVEL_PAREN
       consequent: wrap-statement @then.compile o, LEVEL_TOP
-      alternate:  if @else? then wrap-statement @else.compile o, LEVEL_TOP
+      alternate:  if @else? 
+        else-c = @else.compile o, LEVEL_TOP
+        if else-c instanceof $.IfStatement
+          # prevent else-if trees from gaining an extra level of
+          # indentation by circumventing the default wrap-statement's
+          # BlockStatement-wrapping behavior.
+          else-c
+        else
+          wrap-statement else-c
 
   compileExpression: (o) ->
     {then: thn, else: els or Literal \void} = this
@@ -3560,9 +3568,9 @@ class exports.If extends Node
       # braces.
       $.BlockStatement body:
         if js instanceof $.Statement
-          js
+          [js]
         else
-          $.ExpressionStatement expression: js
+          [$.ExpressionStatement expression: js]
 
 #### Label
 # A labeled block or statement.
