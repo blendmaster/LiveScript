@@ -316,7 +316,7 @@ class exports.Block extends Node
     statements = []
     for node in @lines
       node = node.unfoldSoak o or node
-      ast = (node <<< {+front})compile o, level
+      ast = (node <<< {+front, +void})compile o, level
       if ast instanceof $.Statement
         if ast instanceof $.BlockStatement
           # unwrap JS block statement, as it's pretty much useless
@@ -343,7 +343,6 @@ class exports.Block extends Node
 
     if delete o.eval and @chomp!lines.length
       if o.bare then @lines.push Parens @lines.pop! else @makeReturn!
-
 
     body = @compileWithDeclarations o
 
@@ -1079,7 +1078,7 @@ class exports.Obj extends List
     if rest
       # compile import, making sure to force an import statement
       # rather than gluing both objects back together
-      Import(Obj(to-compile) <<< {front: @front}, Obj(rest), false, true)
+      (Import(Obj(to-compile) <<< {@front}, Obj(rest), false, true) <<< {@void})
         .compile o
     else
       dic = {}
@@ -1555,7 +1554,7 @@ class exports.Binary extends Node
 
     # `'x' * 2` => `'xx'`
     else if x instanceof Literal
-      Literal "#{x.compile(o)value}" * n
+      $.Literal value: "#{x.compile(o)value}" * n
 
     # `"#{x}" * 2` => `(ref$ = "" + x) + ref$`
     else
@@ -2074,7 +2073,7 @@ class exports.Import extends Node
           throw new Error "here #e"
 
     # if we're returning, append left reference
-    if not @void and not node instanceof Splat
+    if not @void and node not instanceof Splat
       body.push reft
 
     Block body .compile o
@@ -2132,43 +2131,44 @@ class exports.In extends Node implements Negatable
 
         # start node with assignment of ref
         # (ref$ = complex) === 1 || ref$ === 2 ...
-        js = $.BinaryExpression do
-          operator: cmp
-          left: sub
-          right:
-            if first-test instanceof Splat
-              # compile utility function against inside of splat
-              (new In(item-ref; first-test.it) <<< {@negated})compile o
-            else
-              first-test.compile o
+        js =
+          if first-test instanceof Splat
+            $.SequenceExpression expressions:
+              * sub
+              * (new In(item-ref; first-test.it) <<< {@negated})compile o
+          else
+            $.BinaryExpression do
+              operator: cmp
+              left: sub
+              right: first-test.compile o
       else
         # simple, use actual item
         item-ref = @item
 
-        js = $.BinaryExpression do
-          operator: cmp
-          left: item-ref.compile o
-          right:
-            if first-test instanceof Splat
-              # compile utility function against inside of splat
-              (new In(item-ref; first-test.it) <<< {@negated})compile o
-            else
-              first-test.compile o
+        js =
+          if first-test instanceof Splat
+            # compile utility function against inside of splat
+            (new In(item-ref; first-test.it) <<< {@negated})compile o
+          else
+            $.BinaryExpression do
+              operator: cmp
+              left: item-ref.compile o
+              right: first-test.compile o
 
       # successively chain other comparisons
       while (test = to-compile.shift!)
         js = $.BinaryExpression do
           operator: cnj
           left: js # previous comparison
-          right: $.BinaryExpression do
-            operator: cmp
-            left: item-ref.compile o
-            right:
-              if test instanceof Splat
-                # compile utility function against inside of splat
-                (new In(item-ref; test.it) <<< {@negated})compile o, LEVEL_TOP
-              else
-                test.compile o, LEVEL_OP
+          right:
+            if test instanceof Splat
+              # compile utility function against inside of splat
+              (new In(item-ref; test.it) <<< {@negated})compile o, LEVEL_TOP
+            else
+              $.BinaryExpression do
+                operator: cmp
+                left: item-ref.compile o
+                right: test.compile o, LEVEL_OP
 
       o.scope.free ref if ref?
 
@@ -3252,7 +3252,6 @@ class exports.For extends While
     if @index? and @index is not ''
       @body.prepend Assign (Var @index), Var idx
 
-
     # set scope's cascade ref to the temp var if present
     o.ref = @item.value if @ref
 
@@ -3388,7 +3387,7 @@ class exports.Switch extends Node
         @anaphorize!compile o, LEVEL_PAREN
       else
         # topic falsy, so use Literal false to make short cases
-        Literal false
+        $.Literal value: false
 
     stop  = @default or @cases.length - 1
 
