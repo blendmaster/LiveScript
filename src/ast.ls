@@ -321,7 +321,8 @@ class exports.Block extends Node
         if ast instanceof $.BlockStatement
           # unwrap JS block statement, as it's pretty much useless
           statements.push ...ast.body
-        else
+        else if ast not instanceof $.EmptyStatement
+          # strip empty statements
           statements.push ast
       else
         statements.push $.ExpressionStatement expression: ast
@@ -440,7 +441,6 @@ class exports.Literal extends Atom
       $.Identifier name: \arguments
     | \void      =>
       if level is LEVEL_TOP
-        throw new Error this
         $.EmptyStatement!
       else
         # void 8
