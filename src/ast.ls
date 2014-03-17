@@ -36,7 +36,10 @@ $ = require \./js
     @traverseChildren !->
       switch it.value
       | \this      => hasThis := true
-      | \arguments => hasArgs := it.value = \args$
+      | \arguments =>
+        hasArgs := \arg$
+        it.abused-by-closure-compile = true
+        it.value = $.Identifier name: \args$
     if hasThis
       call.args.push Literal \this
       call.method = \.call
@@ -412,7 +415,8 @@ class Atom extends Node
 # `this`, `debugger`, regexes and primitives.
 class exports.Literal extends Atom
   (@value) ~>
-    return new Super        if value is \super
+    return new Super        if @value is \super
+    throw new Error if @value is \arg$
 
   isEmpty    : -> @value in <[ void null ]>
   isCallable : -> @value in <[ this eval .. ]>
@@ -468,6 +472,8 @@ class exports.Literal extends Atom
       if @abused-by-let
         @let-abuse # already compiled
       else if @abused-by-star
+        @value # already compiled
+      else if @abused-by-closure-compile
         @value # already compiled
       else
         try
@@ -1286,7 +1292,16 @@ class exports.Unary extends Node
     case \do
       # `do f?` => `f?()`
       if o.level is LEVEL_TOP and it instanceof Fun and it.is-statement!
-        return "#{ it.compile o } #{ Unary \do Var it.name .compile o }"
+        # function.ls test expects the named function to be
+        # available in the scope of this expression, so we need to
+        # actually compile as two separate statements to declare
+        # the fn, then run it. Block compilation with flatten these
+        # two statements into the upper-level block.
+        return $.BlockStatement body:
+          * it.compile o
+          * $.ExpressionStatement expression: $.CallExpression do
+              arguments: []
+              callee: $.Identifier name: it.name
       x = Parens if it instanceof Existence and not it.negated
                  then Chain(it)add Call!
                  else Call.make it
@@ -3514,7 +3529,8 @@ class exports.If extends Node
     {then: thn, else: els or Literal \void} = this
 
     if @void
-      @then.void = @else.void = true
+      @then.void = true
+      @else?void = true
 
     if not @else and (@cond or @void)
       # optimize `if a then b` => `a && b`
